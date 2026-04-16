@@ -1,5 +1,0 @@
-py-clob-client
-streamlit
-pandas
-python-dotenv
-web3
