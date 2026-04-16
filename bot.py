@@ -40,14 +40,19 @@ def _get_clob_client():
         pk = os.getenv("POLY_PRIVATE_KEY")
         if not pk:
             raise RuntimeError("POLY_PRIVATE_KEY env var is not set")
-        _clob_client = ClobClient(
+        # Level 1 — signing key + funder
+        client = ClobClient(
             host=CLOB_API,
             chain_id=POLYGON,
             key=pk,
             funder=FUNDER_ADDRESS,
             signature_type=2,   # POLY_PROXY — MetaMask / proxy wallet
         )
-        log.info(f"ClobClient ready | funder={FUNDER_ADDRESS[:10]}… sig_type=2")
+        # Level 2 — derive API credentials from the private key
+        creds = client.derive_api_key()
+        client.set_api_creds(creds)
+        _clob_client = client
+        log.info(f"ClobClient ready (L2) | funder={FUNDER_ADDRESS[:10]}… sig_type=2")
     return _clob_client
 
 # ── Market Discovery ──────────────────────────────────────────────────────────
