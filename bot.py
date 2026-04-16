@@ -146,52 +146,51 @@ async def place_order(session: aiohttp.ClientSession, market: dict, side: str, s
         state.add_trade_log(f"DRY BUY {shares}x {side} @ {price:.3f}")
         return {"dry": True, "side": side, "shares": shares, "price": price}
 
+    from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType
+    from py_clob_client.order_builder.constants import BUY
+
+    client     = _get_clob_client()
+    loop       = asyncio.get_event_loop()
+    order_args = OrderArgs(
+        price=float(price),
+        size=float(shares),
+        side=BUY,
+        token_id=str(token_id),
+        fee_rate_bps=1000,
+    )
+
+    # ── Step 1: place the order — abort if this fails ──────────────────────
     try:
-        from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType
-        from py_clob_client.order_builder.constants import BUY
+        result   = await loop.run_in_executor(None, lambda: client.create_and_post_order(order_args))
+        order_id = (result or {}).get("orderID", "")
+    except Exception as e:
+        log.error(f"BUY order failed: {e}")
+        return None
 
-        client    = _get_clob_client()
-        loop      = asyncio.get_event_loop()
-        order_args = OrderArgs(
-            price=float(price),
-            size=float(shares),
-            side=BUY,
-            token_id=str(token_id),
-            fee_rate_bps=1000,
+    # Order placed — record immediately so traded flag is set regardless of step 2
+    state.total_bought += round(price * float(shares), 4)
+    log.info(f"BUY placed | {side} {shares}x @ {price:.3f} | {order_id[:12]}")
+    state.add_trade_log(f"BUY {shares}x {side} @ {price:.3f} | {order_id[:12]}")
+
+    # ── Step 2: read actual filled balance (best-effort, never aborts) ────
+    filled = float(shares)
+    try:
+        await asyncio.sleep(0.5)
+        bal_params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL, token_id=str(token_id), signature_type=2
         )
+        bal_resp = await loop.run_in_executor(
+            None, lambda: client.get_balance_allowance(params=bal_params)
+        )
+        actual = float(bal_resp.get("balance", 0)) / 1e6
+        if actual > 0:
+            filled = actual
+    except Exception as e:
+        log.warning(f"Balance check after BUY failed (using {shares}): {e}")
 
-        # ── Step 1: place the order — if this fails, abort ─────────────────
-        try:
-            result   = await loop.run_in_executor(None, lambda: client.create_and_post_order(order_args))
-            order_id = (result or {}).get("orderID", "")
-        except Exception as e:
-            log.error(f"BUY order failed: {e}")
-            return None   # order was NOT placed
-
-        # Order was placed — record immediately so traded flag is set
-        state.total_bought += round(price * float(shares), 4)
-        log.info(f"BUY placed | {side} {shares}x @ {price:.3f} | {order_id[:12]}")
-        state.add_trade_log(f"BUY {shares}x {side} @ {price:.3f} | {order_id[:12]}")
-
-        # ── Step 2: read actual filled balance (best-effort, won't abort) ──
-        filled = float(shares)
-        try:
-            await asyncio.sleep(0.5)
-            bal_params = BalanceAllowanceParams(
-                asset_type=AssetType.CONDITIONAL, token_id=str(token_id), signature_type=2
-            )
-            bal_resp = await loop.run_in_executor(
-                None, lambda: client.get_balance_allowance(params=bal_params)
-            )
-            actual = float(bal_resp.get("balance", 0)) / 1e6
-            if actual > 0:
-                filled = actual
-        except Exception as e:
-            log.warning(f"Balance check after BUY failed (using {shares}): {e}")
-
-        result = result or {}
-        result["filled_shares"] = filled
-        return result
+    result = result or {}
+    result["filled_shares"] = filled
+    return result
 
 
 async def sell_position(session: aiohttp.ClientSession, position: dict, state: BotState, reason: str,
