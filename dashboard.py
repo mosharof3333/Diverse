@@ -554,7 +554,7 @@ async function poll() {
     let r = await fetch('/api/state');
     let d = await r.json();
 
-    // Status dot
+    // Status dot + button state
     let dot = document.getElementById('statusDot');
     let txt = document.getElementById('statusText');
     if (d.running) {
@@ -563,6 +563,8 @@ async function poll() {
     } else {
       dot.className = 'dot idle'; txt.textContent = 'IDLE';
     }
+    document.getElementById('startBtn').disabled = d.running;
+    document.getElementById('stopBtn').disabled = !d.running;
 
     document.getElementById('forceBanner').className = 'force-banner' + (d.force_closing ? ' visible' : '');
 
