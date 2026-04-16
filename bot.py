@@ -330,7 +330,7 @@ async def evaluate_strategy(session: aiohttp.ClientSession, direction: str, stat
     cheaper_key   = f"{cheaper_side}_{direction}"
     cheaper_mkt   = state.markets.get(cheaper_key)
 
-    if cheaper_price <= min_price or dearer_price <= 0.20:
+    if cheaper_price <= min_price or dearer_price <= 0.50:
         return
 
     log.info(
