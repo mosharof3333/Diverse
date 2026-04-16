@@ -25,87 +25,63 @@ DRY_RUN         = os.getenv("DRY_RUN", "true").lower() == "true"
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
 
-FIVE_MIN_KW  = ["5 min", "5-min", "5min", "5 minute", "next 5", "5m ", "5-minute", "five min", "five minute"]
-BTC_KW       = ["btc", "bitcoin"]
-ETH_KW       = ["eth", "ethereum"]
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bot")
 
 # ── Market Discovery ──────────────────────────────────────────────────────────
 async def find_5min_markets(session: aiohttp.ClientSession) -> Optional[dict]:
-    """Find active BTC/ETH 5-min markets via Events API."""
+    """
+    Find active BTC/ETH 5-min markets using deterministic slug lookup.
+
+    Polymarket names these events: {asset}-updown-5m-{window_ts}
+    where window_ts = current Unix timestamp rounded DOWN to the nearest 300s.
+    The event contains ONE market whose clobTokenIds JSON string holds
+    [up_token_id, down_token_id].
+
+    API: GET /events/slug/{slug}  →  {"markets": [{"clobTokenIds": "[id0,id1]", ...}]}
+    """
+    now_ts    = int(time.time())
+    window_ts = (now_ts // 300) * 300
+
     markets = {"btc_up": None, "btc_down": None, "eth_up": None, "eth_down": None}
 
-    search_queries = [
-        # Direct keyword searches — most likely to surface 5-min markets
-        f"{GAMMA_API}/events?q=btc+5+min&active=true&closed=false&limit=50",
-        f"{GAMMA_API}/events?q=eth+5+min&active=true&closed=false&limit=50",
-        f"{GAMMA_API}/events?q=bitcoin+5+minute&active=true&closed=false&limit=50",
-        f"{GAMMA_API}/events?q=ethereum+5+minute&active=true&closed=false&limit=50",
-        f"{GAMMA_API}/events?q=5+minute+crypto&active=true&closed=false&limit=50",
-        # Tag-based fallbacks
-        f"{GAMMA_API}/events?tag=Bitcoin&active=true&closed=false&limit=50",
-        f"{GAMMA_API}/events?tag=Ethereum&active=true&closed=false&limit=50",
-        f"{GAMMA_API}/events?tag=Crypto&active=true&closed=false&limit=50",
-    ]
-
-    seen_ids: set = set()
-
-    def _scan_events(events: list, source: str):
-        for event in events:
-            eid = event.get("id") or event.get("slug")
-            if eid and eid in seen_ids:
-                continue
-            if eid:
-                seen_ids.add(eid)
-
-            title = (event.get("title") or event.get("name") or "").lower()
-            slug  = (event.get("slug") or "").lower()
-            desc  = (event.get("description") or "").lower()
-            text  = f"{title} {slug} {desc}"
-
-            if not any(kw in text for kw in FIVE_MIN_KW):
-                continue
-
-            is_btc = any(kw in text for kw in BTC_KW)
-            is_eth = any(kw in text for kw in ETH_KW)
-
-            for mkt in event.get("markets", []):
-                q = (mkt.get("question") or mkt.get("title") or "").lower()
-                full_text = f"{text} {q}"
-
-                is_up   = any(w in full_text for w in ["up", "higher", "above", "yes"])
-                is_down = any(w in full_text for w in ["down", "lower", "below", "no"])
-
-                end_date = mkt.get("end_date_iso") or mkt.get("endDate") or event.get("end_date_iso")
-
-                if is_btc and is_up   and not markets["btc_up"]:
-                    markets["btc_up"]   = {**mkt, "end_date": end_date}
-                    log.info(f"  ✓ btc_up   → {q[:60]}  [{source}]")
-                if is_btc and is_down and not markets["btc_down"]:
-                    markets["btc_down"] = {**mkt, "end_date": end_date}
-                    log.info(f"  ✓ btc_down → {q[:60]}  [{source}]")
-                if is_eth and is_up   and not markets["eth_up"]:
-                    markets["eth_up"]   = {**mkt, "end_date": end_date}
-                    log.info(f"  ✓ eth_up   → {q[:60]}  [{source}]")
-                if is_eth and is_down and not markets["eth_down"]:
-                    markets["eth_down"] = {**mkt, "end_date": end_date}
-                    log.info(f"  ✓ eth_down → {q[:60]}  [{source}]")
-
-    for url in search_queries:
-        # Stop early once all 4 markets are found
-        if all(markets.values()):
-            break
+    for asset in ("btc", "eth"):
+        slug = f"{asset}-updown-5m-{window_ts}"
+        url  = f"{GAMMA_API}/events/slug/{slug}"
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                if r.status != 200:
+                    log.warning(f"Slug {slug} → HTTP {r.status}")
+                    continue
                 data = await r.json(content_type=None)
-                events = data if isinstance(data, list) else data.get("data", data.get("events", []))
-                source = url.split("?")[1][:40]
-                log.info(f"  query [{source}] → {len(events)} events")
-                _scan_events(events, source)
+
+                mkt_list = data.get("markets", [])
+                if not mkt_list:
+                    log.warning(f"Slug {slug} → no markets in response")
+                    continue
+
+                mkt = mkt_list[0]
+                raw = mkt.get("clobTokenIds", "[]")
+                token_ids = json.loads(raw) if isinstance(raw, str) else raw
+
+                if len(token_ids) < 2:
+                    log.warning(f"Slug {slug} → expected 2 token IDs, got {token_ids}")
+                    continue
+
+                end_date = (mkt.get("endDate") or mkt.get("end_date_iso")
+                            or data.get("endDate") or data.get("end_date_iso"))
+                base = {
+                    "market_id":   mkt.get("id"),
+                    "conditionId": mkt.get("conditionId"),
+                    "end_date":    end_date,
+                }
+                markets[f"{asset}_up"]   = {**base, "token_id": token_ids[0]}
+                markets[f"{asset}_down"] = {**base, "token_id": token_ids[1]}
+                log.info(f"  ✓ {asset} slug={slug} "
+                         f"up={str(token_ids[0])[:16]}… down={str(token_ids[1])[:16]}…")
+
         except Exception as e:
-            log.warning(f"Event fetch failed for {url}: {e}")
+            log.warning(f"Slug fetch failed for {slug}: {e}")
 
     found = sum(1 for v in markets.values() if v)
     log.info(f"Markets found: {found}/4")
@@ -114,23 +90,18 @@ async def find_5min_markets(session: aiohttp.ClientSession) -> Optional[dict]:
 
 # ── Price Fetching ────────────────────────────────────────────────────────────
 async def get_prices(session: aiohttp.ClientSession, markets: dict) -> Optional[dict]:
-    """Get current YES/UP price for each market from CLOB orderbook."""
+    """Get current BUY price for each token from the CLOB /price endpoint."""
     prices = {}
     for key, mkt in markets.items():
         if not mkt:
             return None
         try:
-            token_id = mkt.get("clobTokenIds", [None])[0] or mkt.get("conditionId")
-            url = f"{CLOB_API}/book?token_id={token_id}"
+            token_id = mkt["token_id"]
+            url = f"{CLOB_API}/price?token_id={token_id}&side=BUY"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as r:
                 data = await r.json(content_type=None)
-                # Best ask = what you'd pay to buy YES
-                asks = data.get("asks", [])
-                if asks:
-                    prices[key] = float(asks[0]["price"])
-                else:
-                    bids = data.get("bids", [])
-                    prices[key] = float(bids[0]["price"]) if bids else None
+                price = data.get("price")
+                prices[key] = float(price) if price is not None else None
         except Exception as e:
             log.warning(f"Price fetch failed for {key}: {e}")
             return None
@@ -140,7 +111,7 @@ async def get_prices(session: aiohttp.ClientSession, markets: dict) -> Optional[
 # ── Order Execution ───────────────────────────────────────────────────────────
 async def place_order(session: aiohttp.ClientSession, market: dict, side: str, shares: int, state: BotState):
     """Place buy order. DRY_RUN=true just logs it."""
-    token_id = market.get("clobTokenIds", [None])[0] or market.get("conditionId")
+    token_id = market["token_id"]
     price = state.prices.get(next(k for k, v in state.markets.items() if v == market))
 
     if DRY_RUN:
@@ -183,7 +154,7 @@ async def sell_position(session: aiohttp.ClientSession, position: dict, state: B
     mkt = position["market"]
     shares = position["shares"]
     side = position["side"]
-    token_id = mkt.get("clobTokenIds", [None])[0] or mkt.get("conditionId")
+    token_id = mkt["token_id"]
     current_price = state.prices.get(position["price_key"])
     pnl = (current_price - position["entry_price"]) * shares if current_price else 0
 
