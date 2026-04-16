@@ -189,22 +189,42 @@ async def sell_position(session: aiohttp.ClientSession, position: dict, state: B
         return True
 
     try:
-        from py_clob_client.clob_types import OrderArgs
+        from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType
         from py_clob_client.order_builder.constants import SELL
 
         client = _get_clob_client()
+        loop   = asyncio.get_event_loop()
+
+        # Query actual token balance — BUY may have been partially filled
+        bal_params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL,
+            token_id=str(token_id),
+            signature_type=2,
+        )
+        bal_resp     = await loop.run_in_executor(None, lambda: client.get_balance_allowance(params=bal_params))
+        raw_balance  = float(bal_resp.get("balance", 0))
+        actual_size  = raw_balance / 1e6          # convert raw units → shares
+        sell_size    = min(float(shares), actual_size)
+        log.info(f"SELL balance check: requested={shares} actual={actual_size:.4f} → selling={sell_size:.4f}")
+
+        if sell_size <= 0:
+            log.warning(f"SELL skipped — zero balance for token {str(token_id)[:16]}…")
+            return False
+
+        # Recalculate PnL against what we're actually selling
+        pnl = (current_price - position["entry_price"]) * sell_size if current_price else 0
+
         order_args = OrderArgs(
             price=float(current_price),
-            size=float(shares),
+            size=sell_size,
             side=SELL,
             token_id=str(token_id),
             fee_rate_bps=1000,
         )
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, lambda: client.create_and_post_order(order_args))
+        result   = await loop.run_in_executor(None, lambda: client.create_and_post_order(order_args))
         order_id = (result or {}).get("orderID", "")
-        log.info(f"SELL placed | {side} {shares}x @ {current_price:.3f} PnL={pnl:+.3f} [{reason}] | {order_id[:12]}")
-        state.add_trade_log(f"SELL {shares}x {side} @ {current_price:.3f} PnL={pnl:+.3f} [{reason}]")
+        log.info(f"SELL placed | {side} {sell_size:.4f}x @ {current_price:.3f} PnL={pnl:+.3f} [{reason}] | {order_id[:12]}")
+        state.add_trade_log(f"SELL {sell_size:.4f}x {side} @ {current_price:.3f} PnL={pnl:+.3f} [{reason}]")
         state.total_pnl += pnl
         if pnl > 0:
             state.wins += 1
