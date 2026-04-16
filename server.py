@@ -17,6 +17,14 @@ app = Flask(__name__)
 state = BotState()
 bot_thread = None
 
+# Auto-start runs at module level so it works under gunicorn too
+_auto_start = os.getenv("AUTO_START", "true").lower() == "true"
+if _auto_start:
+    log.info("AUTO_START=true — starting bot automatically")
+    state.running = True
+    bot_thread = threading.Thread(target=start_bot, args=(state,), daemon=True)
+    bot_thread.start()
+
 
 # ── API Routes ────────────────────────────────────────────────────────────────
 
@@ -58,12 +66,4 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    auto_start = os.getenv("AUTO_START", "true").lower() == "true"
-
-    if auto_start:
-        log.info("AUTO_START=true — starting bot automatically")
-        state.running = True
-        bot_thread = threading.Thread(target=start_bot, args=(state,), daemon=True)
-        bot_thread.start()
-
     app.run(host="0.0.0.0", port=port, debug=False)
