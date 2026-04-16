@@ -260,11 +260,18 @@ async def evaluate_strategy(session: aiohttp.ClientSession, direction: str, stat
         return
 
     # ── ENTRY logic (no position) ──────────────────────────────────────────
-    if spread >= SPREAD_ENTRY and btc_price > MIN_PRICE and eth_price > MIN_PRICE:
-        cheaper_side = "btc" if btc_price < eth_price else "eth"
-        cheaper_key  = f"{cheaper_side}_{direction}"
-        cheaper_mkt  = state.markets.get(cheaper_key)
+    if spread >= SPREAD_ENTRY:
+        cheaper_side  = "btc" if btc_price < eth_price else "eth"
+        dearer_side   = "eth" if cheaper_side == "btc" else "btc"
         cheaper_price = btc_price if cheaper_side == "btc" else eth_price
+        dearer_price  = eth_price if cheaper_side == "btc" else btc_price
+
+        # Cheaper side (what we buy) must be > MIN_PRICE (0.50)
+        # Dearer side just needs to be > 0.20 — relaxed filter
+        if cheaper_price <= MIN_PRICE or dearer_price <= 0.20:
+            return
+        cheaper_key = f"{cheaper_side}_{direction}"
+        cheaper_mkt = state.markets.get(cheaper_key)
 
         log.info(f"[{direction.upper()}] ENTRY | spread={spread:.3f} | buy {cheaper_key} @ {cheaper_price:.3f}")
         result = await place_order(session, cheaper_mkt, cheaper_key, SHARES, state)
