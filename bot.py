@@ -17,7 +17,7 @@ from state import BotState
 # Three entry thresholds per direction per window
 SPREAD_ENTRIES  = [0.10, 0.15, 0.30]
 # Min price of the cheaper token per entry level (relaxed for first entry)
-MIN_PRICES      = [0.20, 0.50, 0.50]
+MIN_PRICES      = [0.20, 0.20, 0.20]
 TAKE_PROFIT     = float(os.getenv("TAKE_PROFIT",     "0.985"))
 SHARES          = int(os.getenv("SHARES",            "6"))
 FORCE_CLOSE_SEC = float(os.getenv("FORCE_CLOSE_SEC", "30"))
