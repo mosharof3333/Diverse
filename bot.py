@@ -231,7 +231,7 @@ async def sell_position(session: aiohttp.ClientSession, position: dict, state: B
 
 
 # ── Core Strategy ─────────────────────────────────────────────────────────────
-async def evaluate_strategy(session: aiohttp.ClientSession, direction: str, state: BotState):
+async def evaluate_strategy(session: aiohttp.ClientSession, direction: str, state: BotState, traded: dict):
     """
     direction: 'up' or 'down'
     Compares btc_{direction} vs eth_{direction} prices.
@@ -278,6 +278,9 @@ async def evaluate_strategy(session: aiohttp.ClientSession, direction: str, stat
         return
 
     # ── ENTRY logic (no position) ──────────────────────────────────────────
+    if traded[direction]:
+        return   # one trade per window per direction
+
     if spread >= SPREAD_ENTRY:
         cheaper_side  = "btc" if btc_price < eth_price else "eth"
         dearer_side   = "eth" if cheaper_side == "btc" else "btc"
@@ -305,6 +308,7 @@ async def evaluate_strategy(session: aiohttp.ClientSession, direction: str, stat
                 "entry_spread": spread,
                 "entry_time":   time.time(),
             }
+            traded[direction] = True
             state.total_trades += 1
 
 
@@ -360,6 +364,7 @@ async def run_bot(state: BotState):
 
             # ── Poll loop for this window ─────────────────────────────────
             force_closed = False
+            traded       = {"up": False, "down": False}  # one entry per direction per window
             while state.running:
                 now = time.time()
 
@@ -380,8 +385,8 @@ async def run_bot(state: BotState):
                 if prices:
                     state.prices = prices
                     state.last_update = time.time()
-                    await evaluate_strategy(session, "up",   state)
-                    await evaluate_strategy(session, "down", state)
+                    await evaluate_strategy(session, "up",   state, traded)
+                    await evaluate_strategy(session, "down", state, traded)
                     state.record_prices()
 
                 await asyncio.sleep(POLL_MS / 1000)
