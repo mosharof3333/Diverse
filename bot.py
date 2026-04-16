@@ -14,9 +14,11 @@ from typing import Optional
 from state import BotState
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SPREAD_ENTRY    = float(os.getenv("SPREAD_ENTRY",    "0.15"))
-SPREAD_EXIT     = float(os.getenv("SPREAD_EXIT",     "0.15"))
-MIN_PRICE       = float(os.getenv("MIN_PRICE",       "0.50"))
+# Three entry thresholds per direction per window
+SPREAD_ENTRIES  = [0.10, 0.15, 0.30]
+# Min price of the cheaper token per entry level (relaxed for first entry)
+MIN_PRICES      = [0.20, 0.50, 0.50]
+TAKE_PROFIT     = float(os.getenv("TAKE_PROFIT",     "0.985"))
 SHARES          = int(os.getenv("SHARES",            "6"))
 FORCE_CLOSE_SEC = float(os.getenv("FORCE_CLOSE_SEC", "30"))
 POLL_MS         = int(os.getenv("POLL_MS",           "500"))
@@ -193,6 +195,37 @@ async def place_order(session: aiohttp.ClientSession, market: dict, side: str, s
     return result
 
 
+async def place_take_profit(market: dict, side: str, shares: float, state: BotState):
+    """Place a GTC sell at TAKE_PROFIT price immediately after a buy."""
+    token_id = market["token_id"]
+
+    if DRY_RUN:
+        log.info(f"  [DRY RUN] TP SELL {shares}x {side} @ {TAKE_PROFIT}")
+        state.add_trade_log(f"DRY TP {shares}x {side} @ {TAKE_PROFIT}")
+        return
+
+    try:
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import SELL
+
+        client = _get_clob_client()
+        loop   = asyncio.get_event_loop()
+        order_args = OrderArgs(
+            price=TAKE_PROFIT,
+            size=float(shares),
+            side=SELL,
+            token_id=str(token_id),
+            fee_rate_bps=1000,
+        )
+        signed = await loop.run_in_executor(None, lambda: client.create_order(order_args))
+        result = await loop.run_in_executor(None, lambda: client.post_order(signed, OrderType.GTC))
+        order_id = (result or {}).get("orderID", "")
+        log.info(f"TP order placed | {side} {shares:.4f}x @ {TAKE_PROFIT} | {order_id[:12]}")
+        state.add_trade_log(f"TP {shares:.4f}x {side} @ {TAKE_PROFIT} | {order_id[:12]}")
+    except Exception as e:
+        log.error(f"TP order failed: {e}")
+
+
 async def sell_position(session: aiohttp.ClientSession, position: dict, state: BotState, reason: str,
                         force: bool = False):
     """
@@ -264,7 +297,10 @@ async def sell_position(session: aiohttp.ClientSession, position: dict, state: B
 async def evaluate_strategy(session: aiohttp.ClientSession, direction: str, state: BotState, traded: dict):
     """
     direction: 'up' or 'down'
-    Compares btc_{direction} vs eth_{direction} prices.
+    Up to 3 entries per window at spread thresholds 0.10 / 0.15 / 0.30.
+    Each entry immediately places a GTC take-profit sell at TAKE_PROFIT (0.985).
+    Exit is handled by the TP order filling or force-close at T-30s — no
+    spread-compression exit logic.
     """
     btc_key = f"btc_{direction}"
     eth_key = f"eth_{direction}"
@@ -276,62 +312,41 @@ async def evaluate_strategy(session: aiohttp.ClientSession, direction: str, stat
         return
 
     spread = abs(btc_price - eth_price)
-    pos = state.positions.get(direction)
-
     state.spreads[direction] = spread
 
-    # ── EXIT logic (position open) ─────────────────────────────────────────
-    if pos:
-        entry_spread   = pos["entry_spread"]
-        entry_cheaper  = pos["side"]  # 'btc' or 'eth'
-        current_cheaper = "btc" if btc_price < eth_price else "eth"
-        current_price_of_pos = state.prices.get(pos["price_key"])
-        pnl = (current_price_of_pos - pos["entry_price"]) * pos["shares"] if current_price_of_pos else 0
+    trade_count = traded[direction]
+    if trade_count >= len(SPREAD_ENTRIES):
+        return   # max 3 trades per direction per window
 
-        # Spread compressed or reversed by EXIT threshold
-        spread_moved = (entry_spread - spread) >= SPREAD_EXIT
+    threshold = SPREAD_ENTRIES[trade_count]
+    min_price = MIN_PRICES[trade_count]
 
-        if spread_moved:
-            if pnl > 0:
-                # Profitable — sell
-                log.info(f"[{direction.upper()}] EXIT profitable | spread {spread:.3f} | PnL {pnl:+.4f}")
-                sold = await sell_position(session, pos, state, "SPREAD_CLOSED_PROFIT")
-                if sold:
-                    state.positions[direction] = None
-            else:
-                # Not profitable — buy opposite side once to rebalance, then done
-                opposite_key = eth_key if entry_cheaper == "btc" else btc_key
-                opposite_mkt = state.markets.get(opposite_key)
-                log.info(f"[{direction.upper()}] REBALANCE | spread {spread:.3f} | PnL {pnl:+.4f}")
-                await place_order(session, opposite_mkt, opposite_key, SHARES, state)
-                state.add_trade_log(f"REBALANCE {opposite_key} x{SHARES}")
-                # Clear position so this exit condition doesn't re-fire next tick
-                state.positions[direction] = None
-                traded[direction] = True
+    if spread < threshold:
         return
 
-    # ── ENTRY logic (no position) ──────────────────────────────────────────
-    if traded[direction]:
-        return   # one trade per window per direction
+    cheaper_side  = "btc" if btc_price < eth_price else "eth"
+    cheaper_price = btc_price if cheaper_side == "btc" else eth_price
+    dearer_price  = eth_price if cheaper_side == "btc" else btc_price
+    cheaper_key   = f"{cheaper_side}_{direction}"
+    cheaper_mkt   = state.markets.get(cheaper_key)
 
-    if spread >= SPREAD_ENTRY:
-        cheaper_side  = "btc" if btc_price < eth_price else "eth"
-        dearer_side   = "eth" if cheaper_side == "btc" else "btc"
-        cheaper_price = btc_price if cheaper_side == "btc" else eth_price
-        dearer_price  = eth_price if cheaper_side == "btc" else btc_price
+    if cheaper_price <= min_price or dearer_price <= 0.20:
+        return
 
-        # Cheaper side (what we buy) must be > MIN_PRICE (0.50)
-        # Dearer side just needs to be > 0.20 — relaxed filter
-        if cheaper_price <= MIN_PRICE or dearer_price <= 0.20:
-            return
-        cheaper_key = f"{cheaper_side}_{direction}"
-        cheaper_mkt = state.markets.get(cheaper_key)
+    log.info(
+        f"[{direction.upper()}] ENTRY #{trade_count + 1} | "
+        f"spread={spread:.3f} >= {threshold:.2f} | buy {cheaper_key} @ {cheaper_price:.3f}"
+    )
+    result = await place_order(session, cheaper_mkt, cheaper_key, SHARES, state)
 
-        log.info(f"[{direction.upper()}] ENTRY | spread={spread:.3f} | buy {cheaper_key} @ {cheaper_price:.3f}")
-        result = await place_order(session, cheaper_mkt, cheaper_key, SHARES, state)
+    if result:
+        filled = result.get("filled_shares", float(SHARES))
 
-        if result:
-            filled = result.get("filled_shares", float(SHARES))
+        # Place take-profit GTC sell at 0.985 immediately
+        await place_take_profit(cheaper_mkt, cheaper_key, filled, state)
+
+        pos = state.positions.get(direction)
+        if pos is None:
             state.positions[direction] = {
                 "side":         cheaper_side,
                 "price_key":    cheaper_key,
@@ -341,8 +356,14 @@ async def evaluate_strategy(session: aiohttp.ClientSession, direction: str, stat
                 "entry_spread": spread,
                 "entry_time":   time.time(),
             }
-            traded[direction] = True
-            state.total_trades += 1
+        else:
+            # Accumulate into existing position — weighted average entry price
+            total = pos["shares"] + filled
+            pos["entry_price"] = (pos["entry_price"] * pos["shares"] + cheaper_price * filled) / total
+            pos["shares"]      = total
+
+        traded[direction] += 1
+        state.total_trades += 1
 
 
 # ── Account Sync ─────────────────────────────────────────────────────────────
@@ -384,18 +405,32 @@ async def sync_account_state(state: BotState):
 async def force_close_all(session: aiohttp.ClientSession, state: BotState):
     log.warning(f"⚡ FORCE CLOSE — FAK sell all positions at {FORCE_CLOSE_SEC}s before window end")
     state.force_closing = True
+
+    # Sync real balances first — take-profit GTC may have already filled
+    await sync_account_state(state)
+
     for direction in ["up", "down"]:
         pos = state.positions.get(direction)
-        if pos:
-            await sell_position(session, pos, state, f"FORCE_CLOSE_{FORCE_CLOSE_SEC}s", force=True)
+        if not pos:
+            continue
+        real = pos.get("real_shares", pos["shares"])
+        if real <= 0.001:
+            log.info(f"[{direction.upper()}] TP already filled — skipping force close")
             state.positions[direction] = None
+            continue
+        # Use actual chain balance for the FAK sell
+        pos_to_close = dict(pos)
+        pos_to_close["shares"] = real
+        await sell_position(session, pos_to_close, state, f"FORCE_CLOSE_{FORCE_CLOSE_SEC}s", force=True)
+        state.positions[direction] = None
+
     state.force_closing = False
     log.info("✓ All positions closed")
 
 
 # ── Main Loop ─────────────────────────────────────────────────────────────────
 async def run_bot(state: BotState):
-    log.info(f"Bot starting | DRY_RUN={DRY_RUN} | SPREAD_ENTRY={SPREAD_ENTRY} | SHARES={SHARES}")
+    log.info(f"Bot starting | DRY_RUN={DRY_RUN} | ENTRIES={SPREAD_ENTRIES} | TP={TAKE_PROFIT} | SHARES={SHARES}")
 
     connector = aiohttp.TCPConnector(limit=10)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -432,7 +467,7 @@ async def run_bot(state: BotState):
 
             # ── Poll loop for this window ─────────────────────────────────
             force_closed = False
-            traded       = {"up": False, "down": False}  # one entry per direction per window
+            traded       = {"up": 0, "down": 0}  # counts entries per direction (max 3)
             tick         = 0
             while state.running:
                 now = time.time()
