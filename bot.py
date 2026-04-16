@@ -183,6 +183,10 @@ async def sell_position(session: aiohttp.ClientSession, position: dict, state: B
         log.info(f"  [DRY RUN] SELL {shares}x {side} @ {current_price:.3f} | PnL: {pnl:+.3f} | reason={reason}")
         state.add_trade_log(f"DRY SELL {shares}x {side} @ {current_price:.3f} PnL={pnl:+.3f} [{reason}]")
         state.total_pnl += pnl
+        if pnl > 0:
+            state.wins += 1
+        else:
+            state.losses += 1
         return True
 
     api_key = os.getenv("POLY_API_KEY")
@@ -199,6 +203,10 @@ async def sell_position(session: aiohttp.ClientSession, position: dict, state: B
             log.info(f"Sell placed: {result}")
             state.add_trade_log(f"SELL {shares}x {side} @ {current_price:.3f} PnL={pnl:+.3f} [{reason}]")
             state.total_pnl += pnl
+            if pnl > 0:
+                state.wins += 1
+            else:
+                state.losses += 1
             return True
     except Exception as e:
         log.error(f"Sell failed: {e}")
@@ -349,6 +357,7 @@ async def run_bot(state: BotState):
                     state.last_update = time.time()
                     await evaluate_strategy(session, "up",   state)
                     await evaluate_strategy(session, "down", state)
+                    state.record_prices()
 
                 await asyncio.sleep(POLL_MS / 1000)
 
