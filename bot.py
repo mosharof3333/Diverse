@@ -25,7 +25,7 @@ DRY_RUN         = os.getenv("DRY_RUN", "true").lower() == "true"
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
 
-FIVE_MIN_KW  = ["5 min", "5-min", "5min", "5 minute", "next 5"]
+FIVE_MIN_KW  = ["5 min", "5-min", "5min", "5 minute", "next 5", "5m ", "5-minute", "five min", "five minute"]
 BTC_KW       = ["btc", "bitcoin"]
 ETH_KW       = ["eth", "ethereum"]
 
@@ -38,66 +38,74 @@ async def find_5min_markets(session: aiohttp.ClientSession) -> Optional[dict]:
     markets = {"btc_up": None, "btc_down": None, "eth_up": None, "eth_down": None}
 
     search_queries = [
+        # Direct keyword searches — most likely to surface 5-min markets
+        f"{GAMMA_API}/events?q=btc+5+min&active=true&closed=false&limit=50",
+        f"{GAMMA_API}/events?q=eth+5+min&active=true&closed=false&limit=50",
+        f"{GAMMA_API}/events?q=bitcoin+5+minute&active=true&closed=false&limit=50",
+        f"{GAMMA_API}/events?q=ethereum+5+minute&active=true&closed=false&limit=50",
+        f"{GAMMA_API}/events?q=5+minute+crypto&active=true&closed=false&limit=50",
+        # Tag-based fallbacks
         f"{GAMMA_API}/events?tag=Bitcoin&active=true&closed=false&limit=50",
         f"{GAMMA_API}/events?tag=Ethereum&active=true&closed=false&limit=50",
         f"{GAMMA_API}/events?tag=Crypto&active=true&closed=false&limit=50",
     ]
 
-    all_events = []
+    seen_ids: set = set()
+
+    def _scan_events(events: list, source: str):
+        for event in events:
+            eid = event.get("id") or event.get("slug")
+            if eid and eid in seen_ids:
+                continue
+            if eid:
+                seen_ids.add(eid)
+
+            title = (event.get("title") or event.get("name") or "").lower()
+            slug  = (event.get("slug") or "").lower()
+            desc  = (event.get("description") or "").lower()
+            text  = f"{title} {slug} {desc}"
+
+            if not any(kw in text for kw in FIVE_MIN_KW):
+                continue
+
+            is_btc = any(kw in text for kw in BTC_KW)
+            is_eth = any(kw in text for kw in ETH_KW)
+
+            for mkt in event.get("markets", []):
+                q = (mkt.get("question") or mkt.get("title") or "").lower()
+                full_text = f"{text} {q}"
+
+                is_up   = any(w in full_text for w in ["up", "higher", "above", "yes"])
+                is_down = any(w in full_text for w in ["down", "lower", "below", "no"])
+
+                end_date = mkt.get("end_date_iso") or mkt.get("endDate") or event.get("end_date_iso")
+
+                if is_btc and is_up   and not markets["btc_up"]:
+                    markets["btc_up"]   = {**mkt, "end_date": end_date}
+                    log.info(f"  ✓ btc_up   → {q[:60]}  [{source}]")
+                if is_btc and is_down and not markets["btc_down"]:
+                    markets["btc_down"] = {**mkt, "end_date": end_date}
+                    log.info(f"  ✓ btc_down → {q[:60]}  [{source}]")
+                if is_eth and is_up   and not markets["eth_up"]:
+                    markets["eth_up"]   = {**mkt, "end_date": end_date}
+                    log.info(f"  ✓ eth_up   → {q[:60]}  [{source}]")
+                if is_eth and is_down and not markets["eth_down"]:
+                    markets["eth_down"] = {**mkt, "end_date": end_date}
+                    log.info(f"  ✓ eth_down → {q[:60]}  [{source}]")
+
     for url in search_queries:
+        # Stop early once all 4 markets are found
+        if all(markets.values()):
+            break
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
                 data = await r.json(content_type=None)
                 events = data if isinstance(data, list) else data.get("data", data.get("events", []))
-                all_events.extend(events)
+                source = url.split("?")[1][:40]
+                log.info(f"  query [{source}] → {len(events)} events")
+                _scan_events(events, source)
         except Exception as e:
             log.warning(f"Event fetch failed for {url}: {e}")
-
-    # Deduplicate
-    seen = set()
-    unique = []
-    for e in all_events:
-        eid = e.get("id") or e.get("slug")
-        if eid and eid not in seen:
-            seen.add(eid)
-            unique.append(e)
-
-    log.info(f"Fetched {len(unique)} unique events")
-
-    for event in unique:
-        title = (event.get("title") or event.get("name") or "").lower()
-        slug  = (event.get("slug") or "").lower()
-        desc  = (event.get("description") or "").lower()
-        text  = f"{title} {slug} {desc}"
-
-        # Must be 5-min
-        if not any(kw in text for kw in FIVE_MIN_KW):
-            continue
-
-        is_btc = any(kw in text for kw in BTC_KW)
-        is_eth = any(kw in text for kw in ETH_KW)
-
-        for mkt in event.get("markets", []):
-            q = (mkt.get("question") or mkt.get("title") or "").lower()
-            full_text = f"{text} {q}"
-
-            is_up   = any(w in full_text for w in ["up", "higher", "above", "yes"])
-            is_down = any(w in full_text for w in ["down", "lower", "below", "no"])
-
-            end_date = mkt.get("end_date_iso") or mkt.get("endDate") or event.get("end_date_iso")
-
-            if is_btc and is_up   and not markets["btc_up"]:
-                markets["btc_up"]   = {**mkt, "end_date": end_date}
-                log.info(f"  ✓ btc_up   → {q[:60]}")
-            if is_btc and is_down and not markets["btc_down"]:
-                markets["btc_down"] = {**mkt, "end_date": end_date}
-                log.info(f"  ✓ btc_down → {q[:60]}")
-            if is_eth and is_up   and not markets["eth_up"]:
-                markets["eth_up"]   = {**mkt, "end_date": end_date}
-                log.info(f"  ✓ eth_up   → {q[:60]}")
-            if is_eth and is_down and not markets["eth_down"]:
-                markets["eth_down"] = {**mkt, "end_date": end_date}
-                log.info(f"  ✓ eth_down → {q[:60]}")
 
     found = sum(1 for v in markets.values() if v)
     log.info(f"Markets found: {found}/4")
