@@ -147,7 +147,7 @@ async def place_order(session: aiohttp.ClientSession, market: dict, side: str, s
         return {"dry": True, "side": side, "shares": shares, "price": price}
 
     try:
-        from py_clob_client.clob_types import OrderArgs
+        from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType
         from py_clob_client.order_builder.constants import BUY
 
         client = _get_clob_client()
@@ -159,10 +159,20 @@ async def place_order(session: aiohttp.ClientSession, market: dict, side: str, s
             fee_rate_bps=1000,
         )
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, lambda: client.create_and_post_order(order_args))
+        result   = await loop.run_in_executor(None, lambda: client.create_and_post_order(order_args))
         order_id = (result or {}).get("orderID", "")
-        log.info(f"BUY placed | {side} {shares}x @ {price:.3f} | orderID={order_id[:12]}")
-        state.add_trade_log(f"BUY {shares}x {side} @ {price:.3f} | {order_id[:12]}")
+
+        # Give the CLOB a moment to settle, then read actual filled balance
+        await asyncio.sleep(0.5)
+        bal_params  = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=str(token_id), signature_type=2)
+        bal_resp    = await loop.run_in_executor(None, lambda: client.get_balance_allowance(params=bal_params))
+        filled      = float(bal_resp.get("balance", 0)) / 1e6
+        if filled <= 0:
+            filled = float(shares)   # fallback if balance not yet reflected
+
+        log.info(f"BUY placed | {side} requested={shares} filled={filled:.4f} @ {price:.3f} | {order_id[:12]}")
+        state.add_trade_log(f"BUY {filled:.4f}x {side} @ {price:.3f} | {order_id[:12]}")
+        result["filled_shares"] = filled
         return result
     except Exception as e:
         log.error(f"BUY order failed: {e}")
@@ -189,42 +199,23 @@ async def sell_position(session: aiohttp.ClientSession, position: dict, state: B
         return True
 
     try:
-        from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType
+        from py_clob_client.clob_types import OrderArgs
         from py_clob_client.order_builder.constants import SELL
 
         client = _get_clob_client()
         loop   = asyncio.get_event_loop()
 
-        # Query actual token balance — BUY may have been partially filled
-        bal_params = BalanceAllowanceParams(
-            asset_type=AssetType.CONDITIONAL,
-            token_id=str(token_id),
-            signature_type=2,
-        )
-        bal_resp     = await loop.run_in_executor(None, lambda: client.get_balance_allowance(params=bal_params))
-        raw_balance  = float(bal_resp.get("balance", 0))
-        actual_size  = raw_balance / 1e6          # convert raw units → shares
-        sell_size    = min(float(shares), actual_size)
-        log.info(f"SELL balance check: requested={shares} actual={actual_size:.4f} → selling={sell_size:.4f}")
-
-        if sell_size <= 0:
-            log.warning(f"SELL skipped — zero balance for token {str(token_id)[:16]}…")
-            return False
-
-        # Recalculate PnL against what we're actually selling
-        pnl = (current_price - position["entry_price"]) * sell_size if current_price else 0
-
         order_args = OrderArgs(
             price=float(current_price),
-            size=sell_size,
+            size=float(shares),   # already the actual filled amount from BUY
             side=SELL,
             token_id=str(token_id),
             fee_rate_bps=1000,
         )
         result   = await loop.run_in_executor(None, lambda: client.create_and_post_order(order_args))
         order_id = (result or {}).get("orderID", "")
-        log.info(f"SELL placed | {side} {sell_size:.4f}x @ {current_price:.3f} PnL={pnl:+.3f} [{reason}] | {order_id[:12]}")
-        state.add_trade_log(f"SELL {sell_size:.4f}x {side} @ {current_price:.3f} PnL={pnl:+.3f} [{reason}]")
+        log.info(f"SELL placed | {side} {shares:.4f}x @ {current_price:.3f} PnL={pnl:+.3f} [{reason}] | {order_id[:12]}")
+        state.add_trade_log(f"SELL {shares:.4f}x {side} @ {current_price:.3f} PnL={pnl:+.3f} [{reason}]")
         state.total_pnl += pnl
         if pnl > 0:
             state.wins += 1
@@ -265,7 +256,7 @@ async def evaluate_strategy(session: aiohttp.ClientSession, direction: str, stat
         entry_cheaper  = pos["side"]  # 'btc' or 'eth'
         current_cheaper = "btc" if btc_price < eth_price else "eth"
         current_price_of_pos = state.prices.get(pos["price_key"])
-        pnl = (current_price_of_pos - pos["entry_price"]) * SHARES if current_price_of_pos else 0
+        pnl = (current_price_of_pos - pos["entry_price"]) * pos["shares"] if current_price_of_pos else 0
 
         # Spread compressed or reversed by EXIT threshold
         spread_moved = (entry_spread - spread) >= SPREAD_EXIT
@@ -304,14 +295,15 @@ async def evaluate_strategy(session: aiohttp.ClientSession, direction: str, stat
         result = await place_order(session, cheaper_mkt, cheaper_key, SHARES, state)
 
         if result:
+            filled = result.get("filled_shares", float(SHARES))
             state.positions[direction] = {
-                "side":        cheaper_side,
-                "price_key":   cheaper_key,
-                "market":      cheaper_mkt,
-                "shares":      SHARES,
-                "entry_price": cheaper_price,
+                "side":         cheaper_side,
+                "price_key":    cheaper_key,
+                "market":       cheaper_mkt,
+                "shares":       filled,
+                "entry_price":  cheaper_price,
                 "entry_spread": spread,
-                "entry_time":  time.time(),
+                "entry_time":   time.time(),
             }
             state.total_trades += 1
 
