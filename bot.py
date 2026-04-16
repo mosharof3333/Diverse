@@ -170,6 +170,7 @@ async def place_order(session: aiohttp.ClientSession, market: dict, side: str, s
         if filled <= 0:
             filled = float(shares)   # fallback if balance not yet reflected
 
+        state.total_bought += round(price * filled, 4)
         log.info(f"BUY placed | {side} requested={shares} filled={filled:.4f} @ {price:.3f} | {order_id[:12]}")
         state.add_trade_log(f"BUY {filled:.4f}x {side} @ {price:.3f} | {order_id[:12]}")
         result["filled_shares"] = filled
@@ -232,6 +233,7 @@ async def sell_position(session: aiohttp.ClientSession, position: dict, state: B
         result = await loop.run_in_executor(None, lambda: client.post_order(signed, order_type))
 
         order_id = (result or {}).get("orderID", "")
+        state.total_sold += round(sell_price * float(shares), 4)
         log.info(f"SELL placed | {side} {shares:.4f}x @ {sell_price:.3f} PnL={pnl:+.3f} [{reason}] | {order_id[:12]}")
         state.add_trade_log(f"SELL {shares:.4f}x {side} @ {sell_price:.3f} PnL={pnl:+.3f} [{reason}]")
         state.total_pnl += pnl
@@ -327,6 +329,41 @@ async def evaluate_strategy(session: aiohttp.ClientSession, direction: str, stat
             state.total_trades += 1
 
 
+# ── Account Sync ─────────────────────────────────────────────────────────────
+async def sync_account_state(state: BotState):
+    """Fetch real USDC balance + actual token holdings from CLOB and update state."""
+    if DRY_RUN:
+        return
+    try:
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        client = _get_clob_client()
+        loop   = asyncio.get_event_loop()
+
+        # Real USDC balance in the proxy wallet
+        usdc_params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        usdc_resp   = await loop.run_in_executor(None, lambda: client.get_balance_allowance(params=usdc_params))
+        state.usdc_balance = round(float(usdc_resp.get("balance", 0)) / 1e6, 4)
+
+        # Real token balance for each open position
+        for pos in state.positions.values():
+            if not pos:
+                continue
+            token_id  = pos["market"]["token_id"]
+            tok_params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=str(token_id),
+                signature_type=2,
+            )
+            tok_resp  = await loop.run_in_executor(
+                None, lambda p=tok_params: client.get_balance_allowance(params=p)
+            )
+            real = round(float(tok_resp.get("balance", 0)) / 1e6, 6)
+            pos["real_shares"] = real          # live chain value shown in dashboard
+
+    except Exception as e:
+        log.warning(f"Account sync failed: {e}")
+
+
 # ── Force Close ───────────────────────────────────────────────────────────────
 async def force_close_all(session: aiohttp.ClientSession, state: BotState):
     log.warning(f"⚡ FORCE CLOSE — FAK sell all positions at {FORCE_CLOSE_SEC}s before window end")
@@ -380,6 +417,7 @@ async def run_bot(state: BotState):
             # ── Poll loop for this window ─────────────────────────────────
             force_closed = False
             traded       = {"up": False, "down": False}  # one entry per direction per window
+            tick         = 0
             while state.running:
                 now = time.time()
 
@@ -403,6 +441,11 @@ async def run_bot(state: BotState):
                     await evaluate_strategy(session, "up",   state, traded)
                     await evaluate_strategy(session, "down", state, traded)
                     state.record_prices()
+
+                # Sync real account balances every 10 ticks (~5s)
+                tick += 1
+                if tick % 10 == 0:
+                    await sync_account_state(state)
 
                 await asyncio.sleep(POLL_MS / 1000)
 

@@ -170,7 +170,9 @@ body::before{
 .pnl-neg{color:var(--red);}
 
 /* ── Stats Bar ── */
-.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:0.75rem;}
+.stats-row{display:grid;grid-template-columns:repeat(6,1fr);gap:0.75rem;}
+@media(max-width:1200px){.stats-row{grid-template-columns:repeat(3,1fr);}}
+@media(max-width:700px){.stats-row{grid-template-columns:repeat(2,1fr);}}
 .stat-box{background:var(--panel);border:1px solid var(--border2);border-radius:4px;padding:0.6rem 0.85rem;}
 .stat-label{font-size:0.58rem;color:var(--muted);letter-spacing:0.12em;text-transform:uppercase;}
 .stat-val{font-family:'Orbitron',monospace;font-size:1.1rem;font-weight:700;margin-top:0.15rem;}
@@ -247,12 +249,20 @@ body::before{
       <div class="stat-val" id="statPnl">$0.0000</div>
     </div>
     <div class="stat-box">
-      <div class="stat-label">Trades</div>
-      <div class="stat-val neutral" id="statTrades">0</div>
-    </div>
-    <div class="stat-box">
       <div class="stat-label">Wins / Losses</div>
       <div class="stat-val neutral" id="statWL">0 / 0</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Bought / Sold (USDC)</div>
+      <div class="stat-val neutral" id="statBoughtSold">$0 / $0</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Wallet Balance</div>
+      <div class="stat-val neutral" id="statWallet">—</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Trades</div>
+      <div class="stat-val neutral" id="statTrades">0</div>
     </div>
     <div class="stat-box">
       <div class="stat-label">Markets</div>
@@ -475,10 +485,14 @@ function renderPos(dir, pos) {
   let now = Date.now() / 1000;
   let dur = pos.entry_time ? Math.floor(now - pos.entry_time) : 0;
 
+  let chainMatch = pos.real_shares === pos.shares;
+  let realCol    = chainMatch ? 'var(--green)' : 'var(--yellow)';
   el.innerHTML = `
     <div class="pos-side" style="color:var(--yellow)">${pos.price_key.toUpperCase()}</div>
-    <div class="pos-row"><span class="label">Shares</span><span>${pos.shares}</span></div>
-    <div class="pos-row"><span class="label">Entry</span><span>${parseFloat(pos.entry_price).toFixed(4)}</span></div>
+    <div class="pos-row"><span class="label">Tracked Shares</span><span>${pos.shares}</span></div>
+    <div class="pos-row"><span class="label">Chain Balance</span><span style="color:${realCol}">${pos.real_shares}</span></div>
+    <div class="pos-row"><span class="label">Entry Cost</span><span>$${parseFloat(pos.entry_cost).toFixed(4)}</span></div>
+    <div class="pos-row"><span class="label">Entry Price</span><span>${parseFloat(pos.entry_price).toFixed(4)}</span></div>
     <div class="pos-row"><span class="label">Entry Spread</span><span>${parseFloat(pos.entry_spread).toFixed(4)}</span></div>
     <div class="pos-row"><span class="label">Duration</span><span>${dur}s</span></div>
   `;
@@ -571,6 +585,22 @@ async function poll() {
     pnlEl.className = 'stat-val ' + (pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : 'neutral');
     document.getElementById('statTrades').textContent = d.stats?.total_trades ?? 0;
     document.getElementById('statWL').textContent = `${d.stats?.wins ?? 0} / ${d.stats?.losses ?? 0}`;
+
+    // Bought / Sold
+    let bought = d.stats?.total_bought ?? 0;
+    let sold   = d.stats?.total_sold   ?? 0;
+    document.getElementById('statBoughtSold').textContent =
+      '$' + parseFloat(bought).toFixed(2) + ' / $' + parseFloat(sold).toFixed(2);
+
+    // Wallet balance (real USDC from chain)
+    let walletEl = document.getElementById('statWallet');
+    if (d.usdc_balance != null) {
+      walletEl.textContent = '$' + parseFloat(d.usdc_balance).toFixed(2);
+      walletEl.className = 'stat-val ' + (d.usdc_balance > 0 ? 'pos' : 'neutral');
+    } else {
+      walletEl.textContent = '—';
+      walletEl.className = 'stat-val neutral';
+    }
 
     renderMarkets(d.markets_found);
     updateChart(d.price_history);

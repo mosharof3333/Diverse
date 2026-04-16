@@ -34,6 +34,11 @@ class BotState:
         self.wins         = 0
         self.losses       = 0
 
+        # Real-account tracking (synced from CLOB)
+        self.usdc_balance  = None   # actual USDC in proxy wallet
+        self.total_bought  = 0.0    # cumulative USDC spent on buys
+        self.total_sold    = 0.0    # cumulative USDC received from sells
+
         # Trade log (last 100)
         self.trade_log = deque(maxlen=100)
 
@@ -91,7 +96,10 @@ class BotState:
                     "total_trades": self.total_trades,
                     "wins":         self.wins,
                     "losses":       self.losses,
+                    "total_bought": round(self.total_bought, 4),
+                    "total_sold":   round(self.total_sold, 4),
                 },
+                "usdc_balance": self.usdc_balance,
                 "markets_found": {
                     k: bool(v) for k, v in self.markets.items()
                 },
@@ -103,10 +111,12 @@ class BotState:
         if not pos:
             return None
         return {
-            "side":        pos["side"],
-            "price_key":   pos["price_key"],
-            "shares":      pos["shares"],
-            "entry_price": round(pos["entry_price"], 4),
+            "side":         pos["side"],
+            "price_key":    pos["price_key"],
+            "shares":       round(pos["shares"], 4),
+            "real_shares":  round(pos.get("real_shares", pos["shares"]), 4),
+            "entry_price":  round(pos["entry_price"], 4),
             "entry_spread": round(pos["entry_spread"], 4),
-            "entry_time":  pos["entry_time"],
+            "entry_time":   pos["entry_time"],
+            "entry_cost":   round(pos["entry_price"] * pos["shares"], 4),
         }
