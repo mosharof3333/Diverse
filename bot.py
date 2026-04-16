@@ -156,6 +156,7 @@ async def place_order(session: aiohttp.ClientSession, market: dict, side: str, s
             size=float(shares),
             side=BUY,
             token_id=str(token_id),
+            fee_rate_bps=1000,
         )
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: client.create_and_post_order(order_args))
@@ -197,6 +198,7 @@ async def sell_position(session: aiohttp.ClientSession, position: dict, state: B
             size=float(shares),
             side=SELL,
             token_id=str(token_id),
+            fee_rate_bps=1000,
         )
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: client.create_and_post_order(order_args))
