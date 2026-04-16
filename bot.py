@@ -5,7 +5,6 @@ Strategy: Cross-market spread trading on 5-minute window markets
 
 import asyncio
 import aiohttp
-import math
 import time
 import json
 import os
@@ -300,48 +299,14 @@ async def evaluate_strategy(session: aiohttp.ClientSession, direction: str, stat
                 if sold:
                     state.positions[direction] = None
             else:
-                # Not profitable — sell original first, then buy opposite with recovery shares
+                # Not profitable — buy opposite side once to rebalance, then done
                 opposite_key = eth_key if entry_cheaper == "btc" else btc_key
                 opposite_mkt = state.markets.get(opposite_key)
-                opposite_price = state.prices.get(opposite_key)
-                loss_amount = abs(pnl)
-
-                # Recovery shares: enough so that a SPREAD_EXIT move on the new
-                # position covers the realized loss. Minimum base is SHARES.
-                recovery_shares = math.ceil(loss_amount / SPREAD_EXIT) if loss_amount > 0 else 0
-                rebalance_shares = SHARES + recovery_shares
-
-                log.info(
-                    f"[{direction.upper()}] REBALANCE | spread {spread:.3f} | PnL {pnl:+.4f} "
-                    f"| selling {pos['price_key']}, buying {opposite_key} x{rebalance_shares} "
-                    f"(base={SHARES} + recovery={recovery_shares})"
-                )
-
-                # Step 1 — sell the original position (lock in loss, clear tokens on-chain)
-                await sell_position(session, pos, state, "REBALANCE_SELL")
+                log.info(f"[{direction.upper()}] REBALANCE | spread {spread:.3f} | PnL {pnl:+.4f}")
+                await place_order(session, opposite_mkt, opposite_key, SHARES, state)
+                state.add_trade_log(f"REBALANCE {opposite_key} x{SHARES}")
+                # Clear position so this exit condition doesn't re-fire next tick
                 state.positions[direction] = None
-
-                # Step 2 — buy opposite side with recovery shares
-                result = await place_order(session, opposite_mkt, opposite_key, rebalance_shares, state)
-                state.add_trade_log(
-                    f"REBALANCE {opposite_key} x{rebalance_shares} "
-                    f"(+{recovery_shares} recovery for ${loss_amount:.4f} loss)"
-                )
-
-                # Step 3 — track new position so exit logic + force-close work on it
-                if result and opposite_price:
-                    filled = result.get("filled_shares", float(rebalance_shares))
-                    state.positions[direction] = {
-                        "side":         "btc" if opposite_key.startswith("btc") else "eth",
-                        "price_key":    opposite_key,
-                        "market":       opposite_mkt,
-                        "shares":       filled,
-                        "entry_price":  opposite_price,
-                        "entry_spread": spread,
-                        "entry_time":   time.time(),
-                    }
-                    state.total_trades += 1
-
                 traded[direction] = True
         return
 
