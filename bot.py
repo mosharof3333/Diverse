@@ -18,7 +18,7 @@ SPREAD_ENTRY    = float(os.getenv("SPREAD_ENTRY",    "0.15"))
 SPREAD_EXIT     = float(os.getenv("SPREAD_EXIT",     "0.15"))
 MIN_PRICE       = float(os.getenv("MIN_PRICE",       "0.50"))
 SHARES          = int(os.getenv("SHARES",            "6"))
-FORCE_CLOSE_SEC = float(os.getenv("FORCE_CLOSE_SEC", "4.9"))
+FORCE_CLOSE_SEC = float(os.getenv("FORCE_CLOSE_SEC", "30"))
 POLL_MS         = int(os.getenv("POLL_MS",           "500"))
 DRY_RUN         = os.getenv("DRY_RUN", "false").lower() == "true"
 
@@ -179,8 +179,13 @@ async def place_order(session: aiohttp.ClientSession, market: dict, side: str, s
         return None
 
 
-async def sell_position(session: aiohttp.ClientSession, position: dict, state: BotState, reason: str):
-    """Close a position. DRY_RUN=true just logs; otherwise signs + submits via ClobClient."""
+async def sell_position(session: aiohttp.ClientSession, position: dict, state: BotState, reason: str,
+                        force: bool = False):
+    """
+    Close a position.
+    force=True  → FAK order at aggressive price (0.01) — guarantees fill before window end.
+    force=False → GTC limit order at current market price (normal exit).
+    """
     mkt           = position["market"]
     shares        = position["shares"]
     side          = position["side"]
@@ -189,7 +194,8 @@ async def sell_position(session: aiohttp.ClientSession, position: dict, state: B
     pnl = (current_price - position["entry_price"]) * shares if current_price else 0
 
     if DRY_RUN:
-        log.info(f"  [DRY RUN] SELL {shares}x {side} @ {current_price:.3f} | PnL: {pnl:+.3f} | reason={reason}")
+        tag = "FORCE" if force else "DRY"
+        log.info(f"  [{tag} RUN] SELL {shares}x {side} @ {current_price:.3f} | PnL: {pnl:+.3f} | {reason}")
         state.add_trade_log(f"DRY SELL {shares}x {side} @ {current_price:.3f} PnL={pnl:+.3f} [{reason}]")
         state.total_pnl += pnl
         if pnl > 0:
@@ -199,23 +205,35 @@ async def sell_position(session: aiohttp.ClientSession, position: dict, state: B
         return True
 
     try:
-        from py_clob_client.clob_types import OrderArgs
+        from py_clob_client.clob_types import OrderArgs, OrderType
         from py_clob_client.order_builder.constants import SELL
 
         client = _get_clob_client()
         loop   = asyncio.get_event_loop()
 
+        if force:
+            # FAK at 0.01 — fills immediately against best available bid,
+            # cancels any remainder. Guarantees no tokens are held past window end.
+            sell_price = 0.01
+            order_type = OrderType.FAK
+            log.warning(f"FORCE SELL (FAK) | {side} {shares:.4f}x @ {sell_price} | {reason}")
+        else:
+            sell_price = float(current_price)
+            order_type = OrderType.GTC
+
         order_args = OrderArgs(
-            price=float(current_price),
-            size=float(shares),   # already the actual filled amount from BUY
+            price=sell_price,
+            size=float(shares),
             side=SELL,
             token_id=str(token_id),
             fee_rate_bps=1000,
         )
-        result   = await loop.run_in_executor(None, lambda: client.create_and_post_order(order_args))
+        signed = await loop.run_in_executor(None, lambda: client.create_order(order_args))
+        result = await loop.run_in_executor(None, lambda: client.post_order(signed, order_type))
+
         order_id = (result or {}).get("orderID", "")
-        log.info(f"SELL placed | {side} {shares:.4f}x @ {current_price:.3f} PnL={pnl:+.3f} [{reason}] | {order_id[:12]}")
-        state.add_trade_log(f"SELL {shares:.4f}x {side} @ {current_price:.3f} PnL={pnl:+.3f} [{reason}]")
+        log.info(f"SELL placed | {side} {shares:.4f}x @ {sell_price:.3f} PnL={pnl:+.3f} [{reason}] | {order_id[:12]}")
+        state.add_trade_log(f"SELL {shares:.4f}x {side} @ {sell_price:.3f} PnL={pnl:+.3f} [{reason}]")
         state.total_pnl += pnl
         if pnl > 0:
             state.wins += 1
@@ -224,9 +242,6 @@ async def sell_position(session: aiohttp.ClientSession, position: dict, state: B
         return True
     except Exception as e:
         log.error(f"SELL order failed: {e}")
-        return False
-    except Exception as e:
-        log.error(f"Sell failed: {e}")
         return False
 
 
@@ -314,12 +329,12 @@ async def evaluate_strategy(session: aiohttp.ClientSession, direction: str, stat
 
 # ── Force Close ───────────────────────────────────────────────────────────────
 async def force_close_all(session: aiohttp.ClientSession, state: BotState):
-    log.warning("⚡ FORCE CLOSE — closing all positions at 4.9s before window end")
+    log.warning(f"⚡ FORCE CLOSE — FAK sell all positions at {FORCE_CLOSE_SEC}s before window end")
     state.force_closing = True
     for direction in ["up", "down"]:
         pos = state.positions.get(direction)
         if pos:
-            await sell_position(session, pos, state, "FORCE_CLOSE_4.9s")
+            await sell_position(session, pos, state, f"FORCE_CLOSE_{FORCE_CLOSE_SEC}s", force=True)
             state.positions[direction] = None
     state.force_closing = False
     log.info("✓ All positions closed")
