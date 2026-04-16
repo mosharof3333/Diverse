@@ -20,13 +20,35 @@ MIN_PRICE       = float(os.getenv("MIN_PRICE",       "0.50"))
 SHARES          = int(os.getenv("SHARES",            "6"))
 FORCE_CLOSE_SEC = float(os.getenv("FORCE_CLOSE_SEC", "4.9"))
 POLL_MS         = int(os.getenv("POLL_MS",           "500"))
-DRY_RUN         = os.getenv("DRY_RUN", "true").lower() == "true"
+DRY_RUN         = os.getenv("DRY_RUN", "false").lower() == "true"
 
-GAMMA_API = "https://gamma-api.polymarket.com"
-CLOB_API  = "https://clob.polymarket.com"
+GAMMA_API      = "https://gamma-api.polymarket.com"
+CLOB_API       = "https://clob.polymarket.com"
+FUNDER_ADDRESS = "0x43f39b3abdc334623d822e8b25c00813638492fe"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bot")
+
+# ── CLOB client (lazy init, reused across orders) ─────────────────────────────
+_clob_client = None
+
+def _get_clob_client():
+    global _clob_client
+    if _clob_client is None:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.constants import POLYGON
+        pk = os.getenv("POLY_PRIVATE_KEY")
+        if not pk:
+            raise RuntimeError("POLY_PRIVATE_KEY env var is not set")
+        _clob_client = ClobClient(
+            host=CLOB_API,
+            chain_id=POLYGON,
+            private_key=pk,
+            funder=FUNDER_ADDRESS,
+            signature_type=2,   # POLY_PROXY — MetaMask / proxy wallet
+        )
+        log.info(f"ClobClient ready | funder={FUNDER_ADDRESS[:10]}… sig_type=2")
+    return _clob_client
 
 # ── Market Discovery ──────────────────────────────────────────────────────────
 async def find_5min_markets(session: aiohttp.ClientSession) -> Optional[dict]:
@@ -110,51 +132,43 @@ async def get_prices(session: aiohttp.ClientSession, markets: dict) -> Optional[
 
 # ── Order Execution ───────────────────────────────────────────────────────────
 async def place_order(session: aiohttp.ClientSession, market: dict, side: str, shares: int, state: BotState):
-    """Place buy order. DRY_RUN=true just logs it."""
+    """Place a BUY order. DRY_RUN=true just logs; otherwise signs + submits via ClobClient."""
     token_id = market["token_id"]
     price = state.prices.get(next(k for k, v in state.markets.items() if v == market))
 
     if DRY_RUN:
-        log.info(f"  [DRY RUN] BUY {shares} shares of {side} @ {price:.3f} | token={str(token_id)[:16]}…")
+        log.info(f"  [DRY RUN] BUY {shares}x {side} @ {price:.3f} | token={str(token_id)[:16]}…")
         state.add_trade_log(f"DRY BUY {shares}x {side} @ {price:.3f}")
         return {"dry": True, "side": side, "shares": shares, "price": price}
 
-    # Real order via Polymarket CLOB API
-    # Requires API key + signing — set POLY_API_KEY and POLY_PRIVATE_KEY in env
-    api_key = os.getenv("POLY_API_KEY")
-    if not api_key:
-        log.error("POLY_API_KEY not set — cannot place real order")
-        return None
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "tokenID": token_id,
-        "price": price,
-        "side": "BUY",
-        "size": shares,
-        "orderType": "GTC",
-    }
     try:
-        async with session.post(f"{CLOB_API}/order", json=payload, headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=5)) as r:
-            result = await r.json(content_type=None)
-            log.info(f"Order placed: {result}")
-            state.add_trade_log(f"BUY {shares}x {side} @ {price:.3f} | {result.get('orderID','')[:12]}")
-            return result
+        from py_clob_client.clob_types import OrderArgs
+        from py_clob_client.order_builder.constants import BUY
+
+        client = _get_clob_client()
+        order_args = OrderArgs(
+            price=float(price),
+            size=float(shares),
+            side=BUY,
+            token_id=str(token_id),
+        )
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: client.create_and_post_order(order_args))
+        order_id = (result or {}).get("orderID", "")
+        log.info(f"BUY placed | {side} {shares}x @ {price:.3f} | orderID={order_id[:12]}")
+        state.add_trade_log(f"BUY {shares}x {side} @ {price:.3f} | {order_id[:12]}")
+        return result
     except Exception as e:
-        log.error(f"Order failed: {e}")
+        log.error(f"BUY order failed: {e}")
         return None
 
 
 async def sell_position(session: aiohttp.ClientSession, position: dict, state: BotState, reason: str):
-    """Close/sell a position."""
-    mkt = position["market"]
-    shares = position["shares"]
-    side = position["side"]
-    token_id = mkt["token_id"]
+    """Close a position. DRY_RUN=true just logs; otherwise signs + submits via ClobClient."""
+    mkt           = position["market"]
+    shares        = position["shares"]
+    side          = position["side"]
+    token_id      = mkt["token_id"]
     current_price = state.prices.get(position["price_key"])
     pnl = (current_price - position["entry_price"]) * shares if current_price else 0
 
@@ -168,25 +182,31 @@ async def sell_position(session: aiohttp.ClientSession, position: dict, state: B
             state.losses += 1
         return True
 
-    api_key = os.getenv("POLY_API_KEY")
-    if not api_key:
-        log.error("POLY_API_KEY not set")
-        return False
-
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {"tokenID": token_id, "price": current_price, "side": "SELL", "size": shares, "orderType": "GTC"}
     try:
-        async with session.post(f"{CLOB_API}/order", json=payload, headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=5)) as r:
-            result = await r.json(content_type=None)
-            log.info(f"Sell placed: {result}")
-            state.add_trade_log(f"SELL {shares}x {side} @ {current_price:.3f} PnL={pnl:+.3f} [{reason}]")
-            state.total_pnl += pnl
-            if pnl > 0:
-                state.wins += 1
-            else:
-                state.losses += 1
-            return True
+        from py_clob_client.clob_types import OrderArgs
+        from py_clob_client.order_builder.constants import SELL
+
+        client = _get_clob_client()
+        order_args = OrderArgs(
+            price=float(current_price),
+            size=float(shares),
+            side=SELL,
+            token_id=str(token_id),
+        )
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: client.create_and_post_order(order_args))
+        order_id = (result or {}).get("orderID", "")
+        log.info(f"SELL placed | {side} {shares}x @ {current_price:.3f} PnL={pnl:+.3f} [{reason}] | {order_id[:12]}")
+        state.add_trade_log(f"SELL {shares}x {side} @ {current_price:.3f} PnL={pnl:+.3f} [{reason}]")
+        state.total_pnl += pnl
+        if pnl > 0:
+            state.wins += 1
+        else:
+            state.losses += 1
+        return True
+    except Exception as e:
+        log.error(f"SELL order failed: {e}")
+        return False
     except Exception as e:
         log.error(f"Sell failed: {e}")
         return False
