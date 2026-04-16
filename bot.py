@@ -43,7 +43,7 @@ def _get_clob_client():
         _clob_client = ClobClient(
             host=CLOB_API,
             chain_id=POLYGON,
-            private_key=pk,
+            key=pk,
             funder=FUNDER_ADDRESS,
             signature_type=2,   # POLY_PROXY — MetaMask / proxy wallet
         )
