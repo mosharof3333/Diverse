@@ -22,11 +22,11 @@ class BotState:
 
         # Prices & spreads
         self.prices  = {}
-        self.spreads = {"up": None, "down": None}
+        self.spreads = {"a": None, "b": None}  # a=BTC_UP/ETH_DOWN, b=BTC_DOWN/ETH_UP
         self.last_update = None
 
-        # Positions: direction -> dict or None
-        self.positions = {"up": None, "down": None}
+        # Positions: pair -> dict or None
+        self.positions = {"a": None, "b": None}
 
         # Stats
         self.total_pnl    = 0.0
@@ -61,16 +61,13 @@ class BotState:
                 "eth_up":   self.prices.get("eth_up"),
                 "btc_down": self.prices.get("btc_down"),
                 "eth_down": self.prices.get("eth_down"),
-                "spread_up":   self.spreads.get("up"),
-                "spread_down": self.spreads.get("down"),
+                "spread_a": self.spreads.get("a"),
+                "spread_b": self.spreads.get("b"),
             })
 
     def to_dict(self):
         """Serialize for API response."""
         with self._lock:
-            pos_up   = self.positions.get("up")
-            pos_down = self.positions.get("down")
-
             return {
                 "running":       self.running,
                 "force_closing": self.force_closing,
@@ -84,12 +81,12 @@ class BotState:
                     "eth_down": self.prices.get("eth_down"),
                 },
                 "spreads": {
-                    "up":   self.spreads.get("up"),
-                    "down": self.spreads.get("down"),
+                    "a": self.spreads.get("a"),
+                    "b": self.spreads.get("b"),
                 },
                 "positions": {
-                    "up":   self._fmt_pos(pos_up),
-                    "down": self._fmt_pos(pos_down),
+                    "a": self._fmt_pos(self.positions.get("a")),
+                    "b": self._fmt_pos(self.positions.get("b")),
                 },
                 "stats": {
                     "total_pnl":    round(self.total_pnl, 4),
@@ -111,12 +108,16 @@ class BotState:
         if not pos:
             return None
         return {
-            "side":         pos["side"],
-            "price_key":    pos["price_key"],
-            "shares":       round(pos["shares"], 4),
-            "real_shares":  round(pos.get("real_shares", pos["shares"]), 4),
-            "entry_price":  round(pos["entry_price"], 4),
             "entry_spread": round(pos["entry_spread"], 4),
             "entry_time":   pos["entry_time"],
-            "entry_cost":   round(pos["entry_price"] * pos["shares"], 4),
+            "tokens": [
+                {
+                    "key":        t["key"],
+                    "shares":     round(t["shares"], 4),
+                    "real_shares": round(t.get("real_shares", t["shares"]), 4),
+                    "entry_price": round(t["entry_price"], 4),
+                    "entry_cost":  round(t["entry_price"] * t["shares"], 4),
+                }
+                for t in pos["tokens"]
+            ],
         }

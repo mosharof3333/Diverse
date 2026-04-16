@@ -294,75 +294,75 @@ async def sell_position(session: aiohttp.ClientSession, position: dict, state: B
 
 
 # ── Core Strategy ─────────────────────────────────────────────────────────────
-async def evaluate_strategy(session: aiohttp.ClientSession, direction: str, state: BotState, traded: dict):
+async def evaluate_pair(session: aiohttp.ClientSession, pair: str, state: BotState, traded: dict):
     """
-    direction: 'up' or 'down'
-    Up to 3 entries per window at spread thresholds 0.10 / 0.15 / 0.30.
-    Each entry immediately places a GTC take-profit sell at TAKE_PROFIT (0.985).
-    Exit is handled by the TP order filling or force-close at T-30s — no
-    spread-compression exit logic.
+    pair 'a': BTC_UP + ETH_DOWN — spread = abs(btc_up_price - eth_down_price)
+    pair 'b': BTC_DOWN + ETH_UP — spread = abs(btc_down_price - eth_up_price)
+
+    When spread >= threshold, buy BOTH tokens in the pair and immediately
+    place a GTC TP sell at 0.985 for each. Up to 3 entries per pair per window.
     """
-    btc_key = f"btc_{direction}"
-    eth_key = f"eth_{direction}"
+    if pair == "a":
+        key1, key2 = "btc_up", "eth_down"
+    else:
+        key1, key2 = "btc_down", "eth_up"
 
-    btc_price = state.prices.get(btc_key)
-    eth_price  = state.prices.get(eth_key)
+    price1 = state.prices.get(key1)
+    price2 = state.prices.get(key2)
 
-    if btc_price is None or eth_price is None:
+    if price1 is None or price2 is None:
         return
 
-    spread = abs(btc_price - eth_price)
-    state.spreads[direction] = spread
+    spread = abs(price1 - price2)
+    state.spreads[pair] = spread
 
-    trade_count = traded[direction]
+    trade_count = traded[pair]
     if trade_count >= len(SPREAD_ENTRIES):
-        return   # max 3 trades per direction per window
+        return
 
     threshold = SPREAD_ENTRIES[trade_count]
-    min_price = MIN_PRICES[trade_count]
-
     if spread < threshold:
         return
 
-    cheaper_side  = "btc" if btc_price < eth_price else "eth"
-    cheaper_price = btc_price if cheaper_side == "btc" else eth_price
-    dearer_price  = eth_price if cheaper_side == "btc" else btc_price
-    cheaper_key   = f"{cheaper_side}_{direction}"
-    cheaper_mkt   = state.markets.get(cheaper_key)
-
-    if cheaper_price <= min_price or dearer_price <= 0.50:
+    if price1 <= 0.20 or price2 <= 0.20:
         return
 
+    mkt1 = state.markets.get(key1)
+    mkt2 = state.markets.get(key2)
+
     log.info(
-        f"[{direction.upper()}] ENTRY #{trade_count + 1} | "
-        f"spread={spread:.3f} >= {threshold:.2f} | buy {cheaper_key} @ {cheaper_price:.3f}"
+        f"[PAIR-{pair.upper()}] ENTRY #{trade_count + 1} | "
+        f"spread={spread:.3f} >= {threshold:.2f} | "
+        f"{key1} @ {price1:.3f} + {key2} @ {price2:.3f}"
     )
-    result = await place_order(session, cheaper_mkt, cheaper_key, SHARES, state)
 
-    if result:
-        filled = result.get("filled_shares", float(SHARES))
+    result1 = await place_order(session, mkt1, key1, SHARES, state)
+    result2 = await place_order(session, mkt2, key2, SHARES, state)
 
-        # Place take-profit GTC sell at 0.985 immediately
-        await place_take_profit(cheaper_mkt, cheaper_key, filled, state)
+    filled1 = result1.get("filled_shares", float(SHARES)) if result1 else 0.0
+    filled2 = result2.get("filled_shares", float(SHARES)) if result2 else 0.0
 
-        pos = state.positions.get(direction)
+    if result1:
+        await place_take_profit(mkt1, key1, filled1, state)
+    if result2:
+        await place_take_profit(mkt2, key2, filled2, state)
+
+    if result1 or result2:
+        pos = state.positions.get(pair)
         if pos is None:
-            state.positions[direction] = {
-                "side":         cheaper_side,
-                "price_key":    cheaper_key,
-                "market":       cheaper_mkt,
-                "shares":       filled,
-                "entry_price":  cheaper_price,
+            state.positions[pair] = {
+                "tokens": [
+                    {"key": key1, "market": mkt1, "shares": filled1, "entry_price": price1},
+                    {"key": key2, "market": mkt2, "shares": filled2, "entry_price": price2},
+                ],
                 "entry_spread": spread,
                 "entry_time":   time.time(),
             }
         else:
-            # Accumulate into existing position — weighted average entry price
-            total = pos["shares"] + filled
-            pos["entry_price"] = (pos["entry_price"] * pos["shares"] + cheaper_price * filled) / total
-            pos["shares"]      = total
+            pos["tokens"][0]["shares"] += filled1
+            pos["tokens"][1]["shares"] += filled2
 
-        traded[direction] += 1
+        traded[pair] += 1
         state.total_trades += 1
 
 
@@ -376,26 +376,24 @@ async def sync_account_state(state: BotState):
         client = _get_clob_client()
         loop   = asyncio.get_event_loop()
 
-        # Real USDC balance in the proxy wallet
         usdc_params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         usdc_resp   = await loop.run_in_executor(None, lambda: client.get_balance_allowance(params=usdc_params))
         state.usdc_balance = round(float(usdc_resp.get("balance", 0)) / 1e6, 4)
 
-        # Real token balance for each open position
         for pos in state.positions.values():
             if not pos:
                 continue
-            token_id  = pos["market"]["token_id"]
-            tok_params = BalanceAllowanceParams(
-                asset_type=AssetType.CONDITIONAL,
-                token_id=str(token_id),
-                signature_type=2,
-            )
-            tok_resp  = await loop.run_in_executor(
-                None, lambda p=tok_params: client.get_balance_allowance(params=p)
-            )
-            real = round(float(tok_resp.get("balance", 0)) / 1e6, 6)
-            pos["real_shares"] = real          # live chain value shown in dashboard
+            for token in pos["tokens"]:
+                token_id   = token["market"]["token_id"]
+                tok_params = BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=str(token_id),
+                    signature_type=2,
+                )
+                tok_resp = await loop.run_in_executor(
+                    None, lambda p=tok_params: client.get_balance_allowance(params=p)
+                )
+                token["real_shares"] = round(float(tok_resp.get("balance", 0)) / 1e6, 6)
 
     except Exception as e:
         log.warning(f"Account sync failed: {e}")
@@ -406,23 +404,26 @@ async def force_close_all(session: aiohttp.ClientSession, state: BotState):
     log.warning(f"⚡ FORCE CLOSE — FAK sell all positions at {FORCE_CLOSE_SEC}s before window end")
     state.force_closing = True
 
-    # Sync real balances first — take-profit GTC may have already filled
     await sync_account_state(state)
 
-    for direction in ["up", "down"]:
-        pos = state.positions.get(direction)
+    for pair in ["a", "b"]:
+        pos = state.positions.get(pair)
         if not pos:
             continue
-        real = pos.get("real_shares", pos["shares"])
-        if real <= 0.001:
-            log.info(f"[{direction.upper()}] TP already filled — skipping force close")
-            state.positions[direction] = None
-            continue
-        # Use actual chain balance for the FAK sell
-        pos_to_close = dict(pos)
-        pos_to_close["shares"] = real
-        await sell_position(session, pos_to_close, state, f"FORCE_CLOSE_{FORCE_CLOSE_SEC}s", force=True)
-        state.positions[direction] = None
+        for token in pos["tokens"]:
+            real = token.get("real_shares", token["shares"])
+            if real <= 0.001:
+                log.info(f"TP already filled for {token['key']} — skipping")
+                continue
+            single = {
+                "market":      token["market"],
+                "side":        token["key"],
+                "price_key":   token["key"],
+                "shares":      real,
+                "entry_price": token["entry_price"],
+            }
+            await sell_position(session, single, state, f"FORCE_CLOSE_{FORCE_CLOSE_SEC}s", force=True)
+        state.positions[pair] = None
 
     state.force_closing = False
     log.info("✓ All positions closed")
@@ -467,7 +468,7 @@ async def run_bot(state: BotState):
 
             # ── Poll loop for this window ─────────────────────────────────
             force_closed = False
-            traded       = {"up": 0, "down": 0}  # counts entries per direction (max 3)
+            traded       = {"a": 0, "b": 0}  # counts entries per pair (max 3)
             tick         = 0
             while state.running:
                 now = time.time()
@@ -489,8 +490,8 @@ async def run_bot(state: BotState):
                 if prices:
                     state.prices = prices
                     state.last_update = time.time()
-                    await evaluate_strategy(session, "up",   state, traded)
-                    await evaluate_strategy(session, "down", state, traded)
+                    await evaluate_pair(session, "a", state, traded)
+                    await evaluate_pair(session, "b", state, traded)
                     state.record_prices()
 
                 # Sync real account balances every 10 ticks (~5s)

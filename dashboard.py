@@ -318,13 +318,13 @@ body::before{
   <!-- Mid Row -->
   <div class="mid-row">
 
-    <!-- Spread UP -->
+    <!-- Spread Pair A -->
     <div class="panel cyan">
-      <div class="panel-label">Spread — UP Markets (BTC vs ETH)</div>
-      <div class="spread-val" id="spreadUp">0.000</div>
+      <div class="panel-label">Pair A — BTC&#x2191; + ETH&#x2193; Spread</div>
+      <div class="spread-val" id="spreadA">0.000</div>
       <div class="spread-bar-wrap">
-        <div class="spread-bar-bg"><div class="spread-bar-fill" id="spreadUpBar" style="width:0%"></div></div>
-        <div class="spread-threshold"><span>0.00</span><span>ENTRY: 0.15</span><span>0.30</span></div>
+        <div class="spread-bar-bg"><div class="spread-bar-fill" id="spreadABar" style="width:0%"></div></div>
+        <div class="spread-threshold"><span>0.00</span><span>0.10 / 0.15 / 0.30</span><span>0.30</span></div>
       </div>
     </div>
 
@@ -346,13 +346,13 @@ body::before{
       </div>
     </div>
 
-    <!-- Spread DOWN -->
+    <!-- Spread Pair B -->
     <div class="panel orange">
-      <div class="panel-label">Spread — DOWN Markets (BTC vs ETH)</div>
-      <div class="spread-val" style="color:var(--orange)" id="spreadDown">0.000</div>
+      <div class="panel-label">Pair B — BTC&#x2193; + ETH&#x2191; Spread</div>
+      <div class="spread-val" style="color:var(--orange)" id="spreadB">0.000</div>
       <div class="spread-bar-wrap">
-        <div class="spread-bar-bg"><div class="spread-bar-fill" id="spreadDownBar" style="width:0%;background:linear-gradient(90deg,var(--orange),var(--yellow))"></div></div>
-        <div class="spread-threshold"><span>0.00</span><span>ENTRY: 0.15</span><span>0.30</span></div>
+        <div class="spread-bar-bg"><div class="spread-bar-fill" id="spreadBBar" style="width:0%;background:linear-gradient(90deg,var(--orange),var(--yellow))"></div></div>
+        <div class="spread-threshold"><span>0.00</span><span>0.10 / 0.15 / 0.30</span><span>0.30</span></div>
       </div>
     </div>
 
@@ -361,16 +361,16 @@ body::before{
   <!-- Positions Row -->
   <div class="mid-row">
     <div class="panel yellow">
-      <div class="panel-label">Position — UP Markets</div>
-      <div id="posUp"><div class="pos-empty">No position open</div></div>
+      <div class="panel-label">Pair A — BTC&#x2191; + ETH&#x2193;</div>
+      <div id="posA"><div class="pos-empty">No position open</div></div>
     </div>
     <div class="panel">
       <div class="panel-label">Last Signal</div>
       <div id="lastSignal" style="font-size:0.7rem;color:var(--muted);margin-top:0.3rem">—</div>
     </div>
     <div class="panel yellow">
-      <div class="panel-label">Position — DOWN Markets</div>
-      <div id="posDown"><div class="pos-empty">No position open</div></div>
+      <div class="panel-label">Pair B — BTC&#x2193; + ETH&#x2191;</div>
+      <div id="posB"><div class="pos-empty">No position open</div></div>
     </div>
   </div>
 
@@ -464,9 +464,9 @@ function setPrice(key, val) {
   }
 }
 
-function setSpread(dir, val) {
-  let idVal = dir === 'up' ? 'spreadUp' : 'spreadDown';
-  let idBar = dir === 'up' ? 'spreadUpBar' : 'spreadDownBar';
+function setSpread(pair, val) {
+  let idVal = pair === 'a' ? 'spreadA' : 'spreadB';
+  let idBar = pair === 'a' ? 'spreadABar' : 'spreadBBar';
   let el = document.getElementById(idVal);
   let bar = document.getElementById(idBar);
   if (!el || !bar) return;
@@ -474,27 +474,34 @@ function setSpread(dir, val) {
   el.textContent = parseFloat(val).toFixed(3);
   let pct = Math.min(100, (val / 0.30) * 100);
   bar.style.width = pct + '%';
-  bar.className = 'spread-bar-fill' + (val >= 0.15 ? ' triggered' : '');
+  bar.className = 'spread-bar-fill' + (val >= 0.10 ? ' triggered' : '');
 }
 
-function renderPos(dir, pos) {
-  let el = document.getElementById('pos' + (dir === 'up' ? 'Up' : 'Down'));
+function renderPos(pair, pos) {
+  let el = document.getElementById('pos' + pair.toUpperCase());
   if (!el) return;
-  if (!pos) { el.innerHTML = '<div class="pos-empty">No position open</div>'; return; }
+  if (!pos || !pos.tokens) { el.innerHTML = '<div class="pos-empty">No position open</div>'; return; }
 
   let now = Date.now() / 1000;
   let dur = pos.entry_time ? Math.floor(now - pos.entry_time) : 0;
 
-  let chainMatch = pos.real_shares === pos.shares;
-  let realCol    = chainMatch ? 'var(--green)' : 'var(--yellow)';
+  let tokensHtml = pos.tokens.map(t => {
+    let match = t.real_shares === t.shares;
+    let col = match ? 'var(--green)' : 'var(--yellow)';
+    return `
+      <div style="margin-top:0.4rem;border-top:1px solid var(--border);padding-top:0.3rem">
+        <div class="pos-side" style="color:var(--cyan);font-size:0.75rem">${t.key.toUpperCase()}</div>
+        <div class="pos-row"><span class="label">Shares</span><span>${t.shares}</span></div>
+        <div class="pos-row"><span class="label">Chain</span><span style="color:${col}">${t.real_shares}</span></div>
+        <div class="pos-row"><span class="label">Entry</span><span>${parseFloat(t.entry_price).toFixed(4)}</span></div>
+        <div class="pos-row"><span class="label">Cost</span><span>$${parseFloat(t.entry_cost).toFixed(4)}</span></div>
+      </div>`;
+  }).join('');
+
   el.innerHTML = `
-    <div class="pos-side" style="color:var(--yellow)">${pos.price_key.toUpperCase()}</div>
-    <div class="pos-row"><span class="label">Tracked Shares</span><span>${pos.shares}</span></div>
-    <div class="pos-row"><span class="label">Chain Balance</span><span style="color:${realCol}">${pos.real_shares}</span></div>
-    <div class="pos-row"><span class="label">Entry Cost</span><span>$${parseFloat(pos.entry_cost).toFixed(4)}</span></div>
-    <div class="pos-row"><span class="label">Entry Price</span><span>${parseFloat(pos.entry_price).toFixed(4)}</span></div>
-    <div class="pos-row"><span class="label">Entry Spread</span><span>${parseFloat(pos.entry_spread).toFixed(4)}</span></div>
+    <div class="pos-row"><span class="label">Spread @ Entry</span><span>${parseFloat(pos.entry_spread).toFixed(4)}</span></div>
     <div class="pos-row"><span class="label">Duration</span><span>${dur}s</span></div>
+    ${tokensHtml}
   `;
 }
 
@@ -574,11 +581,11 @@ async function poll() {
       prevPrices = { ...d.prices };
     }
 
-    setSpread('up',   d.spreads?.up);
-    setSpread('down', d.spreads?.down);
+    setSpread('a', d.spreads?.a);
+    setSpread('b', d.spreads?.b);
     renderTimer(d.seconds_remaining);
-    renderPos('up',   d.positions?.up);
-    renderPos('down', d.positions?.down);
+    renderPos('a', d.positions?.a);
+    renderPos('b', d.positions?.b);
 
     // Stats
     let pnl = d.stats?.total_pnl ?? 0;
@@ -609,12 +616,12 @@ async function poll() {
     renderLog(d.trade_log);
 
     // Last signal
-    if (d.spreads?.up != null && d.spreads?.down != null) {
-      let su = parseFloat(d.spreads.up || 0);
-      let sd = parseFloat(d.spreads.down || 0);
-      let sig = su >= 0.15 ? `UP spread triggered (${su.toFixed(3)})` : sd >= 0.15 ? `DOWN spread triggered (${sd.toFixed(3)})` : 'Watching…';
+    if (d.spreads?.a != null || d.spreads?.b != null) {
+      let sa = parseFloat(d.spreads?.a || 0);
+      let sb = parseFloat(d.spreads?.b || 0);
+      let sig = sa >= 0.10 ? `Pair A triggered (${sa.toFixed(3)})` : sb >= 0.10 ? `Pair B triggered (${sb.toFixed(3)})` : 'Watching…';
       document.getElementById('lastSignal').textContent = sig;
-      document.getElementById('lastSignal').style.color = (su >= 0.15 || sd >= 0.15) ? 'var(--green)' : 'var(--muted)';
+      document.getElementById('lastSignal').style.color = (sa >= 0.10 || sb >= 0.10) ? 'var(--green)' : 'var(--muted)';
     }
 
   } catch(e) { /* ignore */ }
