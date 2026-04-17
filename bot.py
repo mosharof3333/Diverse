@@ -339,6 +339,40 @@ async def evaluate_pair(session: aiohttp.ClientSession, pair: str, state: BotSta
     result1 = await place_order(session, mkt1, key1, SHARES, state)
     result2 = await place_order(session, mkt2, key2, SHARES, state)
 
+    # ── Partial failure: retry the failed side once, then cancel if still failing ──
+    if bool(result1) != bool(result2):
+        failed_key  = key2  if result1 else key1
+        failed_mkt  = mkt2  if result1 else mkt1
+        ok_result   = result1 if result1 else result2
+        ok_key      = key1  if result1 else key2
+        ok_mkt      = mkt1  if result1 else mkt2
+        ok_price    = price1 if result1 else price2
+
+        log.warning(f"[PAIR-{pair.upper()}] {failed_key} buy failed — retrying in 1s")
+        await asyncio.sleep(1)
+        retry = await place_order(session, failed_mkt, failed_key, SHARES, state)
+
+        if retry:
+            # Retry succeeded — treat as normal both-sides fill
+            result1 = ok_result if ok_key == key1 else retry
+            result2 = retry     if ok_key == key1 else ok_result
+        else:
+            # Retry also failed — sell the successful side and stay flat
+            log.warning(
+                f"[PAIR-{pair.upper()}] retry also failed — selling {ok_key} to stay flat"
+            )
+            ok_filled = ok_result.get("filled_shares", float(SHARES))
+            cancel_pos = {
+                "market":      ok_mkt,
+                "side":        ok_key,
+                "price_key":   ok_key,
+                "shares":      ok_filled,
+                "entry_price": ok_price,
+            }
+            await sell_position(session, cancel_pos, state, "PAIR_CANCEL", force=False)
+            state.add_trade_log(f"PAIR CANCEL — sold {ok_key} x{ok_filled:.4f} (other side failed)")
+            return  # abort — traded[pair] NOT incremented, threshold can trigger again
+
     filled1 = result1.get("filled_shares", float(SHARES)) if result1 else 0.0
     filled2 = result2.get("filled_shares", float(SHARES)) if result2 else 0.0
 
