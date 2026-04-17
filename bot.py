@@ -357,11 +357,29 @@ async def evaluate_pair(session: aiohttp.ClientSession, pair: str, state: BotSta
             result1 = ok_result if ok_key == key1 else retry
             result2 = retry     if ok_key == key1 else ok_result
         else:
-            # Retry also failed — sell the successful side and stay flat
+            # Retry also failed — fresh balance check then sell exact shares to stay flat
             log.warning(
                 f"[PAIR-{pair.upper()}] retry also failed — selling {ok_key} to stay flat"
             )
             ok_filled = ok_result.get("filled_shares", float(SHARES))
+            if not DRY_RUN:
+                try:
+                    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                    client = _get_clob_client()
+                    loop   = asyncio.get_event_loop()
+                    bal_params = BalanceAllowanceParams(
+                        asset_type=AssetType.CONDITIONAL,
+                        token_id=str(ok_mkt["token_id"]),
+                        signature_type=2,
+                    )
+                    bal_resp  = await loop.run_in_executor(
+                        None, lambda: client.get_balance_allowance(params=bal_params)
+                    )
+                    fresh = float(bal_resp.get("balance", 0)) / 1e6
+                    if fresh > 0:
+                        ok_filled = fresh
+                except Exception as e:
+                    log.warning(f"Fresh balance check failed, using stored value: {e}")
             cancel_pos = {
                 "market":      ok_mkt,
                 "side":        ok_key,
