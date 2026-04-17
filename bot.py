@@ -14,15 +14,12 @@ from typing import Optional
 from state import BotState
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# Three entry thresholds per direction per window
-SPREAD_ENTRIES  = [0.10, 0.15, 0.30]
-# Min price of the cheaper token per entry level (relaxed for first entry)
-MIN_PRICES      = [0.20, 0.20, 0.20]
-TAKE_PROFIT     = float(os.getenv("TAKE_PROFIT",     "0.985"))
-SHARES          = int(os.getenv("SHARES",            "6"))
-FORCE_CLOSE_SEC = float(os.getenv("FORCE_CLOSE_SEC", "30"))
-POLL_MS         = int(os.getenv("POLL_MS",           "500"))
-DRY_RUN         = os.getenv("DRY_RUN", "false").lower() == "true"
+# Three entry thresholds shared across both pairs per window
+SPREAD_ENTRIES    = [0.10, 0.15, 0.30]
+TAKE_PROFIT       = float(os.getenv("TAKE_PROFIT",     "0.985"))
+SHARES            = int(os.getenv("SHARES",            "6"))
+POLL_MS           = int(os.getenv("POLL_MS",           "500"))
+DRY_RUN           = os.getenv("DRY_RUN", "false").lower() == "true"
 
 GAMMA_API      = "https://gamma-api.polymarket.com"
 CLOB_API       = "https://clob.polymarket.com"
@@ -299,8 +296,8 @@ async def evaluate_pair(session: aiohttp.ClientSession, pair: str, state: BotSta
     pair 'a': BTC_UP + ETH_DOWN — spread = abs(btc_up_price - eth_down_price)
     pair 'b': BTC_DOWN + ETH_UP — spread = abs(btc_down_price - eth_up_price)
 
-    When spread >= threshold, buy BOTH tokens in the pair and immediately
-    place a GTC TP sell at 0.985 for each. Up to 3 entries per pair per window.
+    traded["idx"] is shared across both pairs — once a threshold fires for
+    either pair it is consumed for both. Max 3 trades total per window.
     """
     if pair == "a":
         key1, key2 = "btc_up", "eth_down"
@@ -316,7 +313,7 @@ async def evaluate_pair(session: aiohttp.ClientSession, pair: str, state: BotSta
     spread = abs(price1 - price2)
     state.spreads[pair] = spread
 
-    trade_count = traded[pair]
+    trade_count = traded["idx"]
     if trade_count >= len(SPREAD_ENTRIES):
         return
 
@@ -414,7 +411,7 @@ async def evaluate_pair(session: aiohttp.ClientSession, pair: str, state: BotSta
             pos["tokens"][0]["shares"] += filled1
             pos["tokens"][1]["shares"] += filled2
 
-        traded[pair] += 1
+        traded["idx"] += 1
         state.total_trades += 1
 
 
@@ -449,36 +446,6 @@ async def sync_account_state(state: BotState):
 
     except Exception as e:
         log.warning(f"Account sync failed: {e}")
-
-
-# ── Force Close ───────────────────────────────────────────────────────────────
-async def force_close_all(session: aiohttp.ClientSession, state: BotState):
-    log.warning(f"⚡ FORCE CLOSE — FAK sell all positions at {FORCE_CLOSE_SEC}s before window end")
-    state.force_closing = True
-
-    await sync_account_state(state)
-
-    for pair in ["a", "b"]:
-        pos = state.positions.get(pair)
-        if not pos:
-            continue
-        for token in pos["tokens"]:
-            real = token.get("real_shares", token["shares"])
-            if real <= 0.001:
-                log.info(f"TP already filled for {token['key']} — skipping")
-                continue
-            single = {
-                "market":      token["market"],
-                "side":        token["key"],
-                "price_key":   token["key"],
-                "shares":      real,
-                "entry_price": token["entry_price"],
-            }
-            await sell_position(session, single, state, f"FORCE_CLOSE_{FORCE_CLOSE_SEC}s", force=True)
-        state.positions[pair] = None
-
-    state.force_closing = False
-    log.info("✓ All positions closed")
 
 
 # ── Main Loop ─────────────────────────────────────────────────────────────────
@@ -519,22 +486,22 @@ async def run_bot(state: BotState):
             log.info(f"Window ends: {window_end_str}")
 
             # ── Poll loop for this window ─────────────────────────────────
-            force_closed = False
-            traded       = {"a": 0, "b": 0}  # counts entries per pair (max 3)
-            tick         = 0
+            # traded["idx"] shared across both pairs — consuming one threshold
+            # slot regardless of which pair fires
+            traded = {"idx": 0}
+            tick   = 0
             while state.running:
                 now = time.time()
 
-                # Check if we need to force close
-                if window_end_ts and not force_closed:
+                if window_end_ts:
                     remaining = window_end_ts - now
                     state.seconds_remaining = remaining
-                    if remaining <= FORCE_CLOSE_SEC:
-                        await force_close_all(session, state)
-                        force_closed = True
-                        # Wait for new window
-                        log.info("Waiting 8s for new window…")
-                        await asyncio.sleep(8)
+                    if remaining <= 0:
+                        # Window closed — tokens settle on-chain automatically.
+                        # Clear tracked positions and find the new window.
+                        log.info("Window ended — positions settle on-chain, finding new window")
+                        state.positions = {"a": None, "b": None}
+                        await asyncio.sleep(5)
                         break
 
                 # Fetch prices
