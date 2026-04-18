@@ -35,9 +35,10 @@ class BotState:
         self.losses       = 0
 
         # Real-account tracking (synced from CLOB)
-        self.usdc_balance  = None   # actual USDC in proxy wallet
-        self.total_bought  = 0.0    # cumulative USDC spent on buys
-        self.total_sold    = 0.0    # cumulative USDC received from sells
+        self.usdc_balance   = None
+        self.total_bought   = 0.0
+        self.total_sold     = 0.0
+        self.token_balances = {"btc_up": 0.0, "btc_down": 0.0, "eth_up": 0.0, "eth_down": 0.0}
 
         # Trade log (last 100)
         self.trade_log = deque(maxlen=100)
@@ -96,7 +97,8 @@ class BotState:
                     "total_bought": round(self.total_bought, 4),
                     "total_sold":   round(self.total_sold, 4),
                 },
-                "usdc_balance": self.usdc_balance,
+                "usdc_balance":   self.usdc_balance,
+                "token_balances": {k: round(v, 6) for k, v in self.token_balances.items()},
                 "markets_found": {
                     k: bool(v) for k, v in self.markets.items()
                 },

@@ -417,7 +417,7 @@ async def evaluate_pair(session: aiohttp.ClientSession, pair: str, state: BotSta
 
 # ── Account Sync ─────────────────────────────────────────────────────────────
 async def sync_account_state(state: BotState):
-    """Fetch real USDC balance + actual token holdings from CLOB and update state."""
+    """Fetch USDC balance + all 4 token holdings from CLOB and update state."""
     if DRY_RUN:
         return
     try:
@@ -429,20 +429,27 @@ async def sync_account_state(state: BotState):
         usdc_resp   = await loop.run_in_executor(None, lambda: client.get_balance_allowance(params=usdc_params))
         state.usdc_balance = round(float(usdc_resp.get("balance", 0)) / 1e6, 4)
 
+        # Sync all 4 token balances from markets (drives dashboard wallet display)
+        for key, mkt in state.markets.items():
+            if not mkt:
+                continue
+            tok_params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=str(mkt["token_id"]),
+                signature_type=2,
+            )
+            tok_resp = await loop.run_in_executor(
+                None, lambda p=tok_params: client.get_balance_allowance(params=p)
+            )
+            bal = round(float(tok_resp.get("balance", 0)) / 1e6, 6)
+            state.token_balances[key] = bal
+
+        # Update real_shares on open positions from synced balances
         for pos in state.positions.values():
             if not pos:
                 continue
             for token in pos["tokens"]:
-                token_id   = token["market"]["token_id"]
-                tok_params = BalanceAllowanceParams(
-                    asset_type=AssetType.CONDITIONAL,
-                    token_id=str(token_id),
-                    signature_type=2,
-                )
-                tok_resp = await loop.run_in_executor(
-                    None, lambda p=tok_params: client.get_balance_allowance(params=p)
-                )
-                token["real_shares"] = round(float(tok_resp.get("balance", 0)) / 1e6, 6)
+                token["real_shares"] = state.token_balances.get(token["key"], token["shares"])
 
     except Exception as e:
         log.warning(f"Account sync failed: {e}")
